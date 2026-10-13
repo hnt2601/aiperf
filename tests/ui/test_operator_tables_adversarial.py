@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.ui.node_utils import FORMAT_JS, run_node
+from tests.ui.node_utils import FORMAT_JS, local_module_js, run_node
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _JOB_TABLE_PATH = (
@@ -19,6 +19,10 @@ _SWEEPS_PAGE_PATH = (
 _CELLS_TABLE_PATH = (
     _REPO_ROOT / "src" / "aiperf" / "operator" / "ui" / "components" / "cells-table.js"
 )
+
+# lib/grouping.js is import-free; the sweeps page harness splices the real
+# helpers (facets, label badges, grouping) rather than stubbing them.
+_GROUPING_JS = local_module_js("lib/grouping.js")
 
 
 def _job_script(expression: str) -> str:
@@ -144,6 +148,18 @@ def _sweeps_script(expression: str) -> str:
         function ModelPill(props) {{ return {{ component: 'ModelPill', props }}; }}
         function RelativeTime(props) {{ return {{ component: 'RelativeTime', props }}; }}
         function LoadingPanel(props) {{ return {{ component: 'LoadingPanel', props }}; }}
+        const jobs = {{ value: [] }};
+        function replaceRoute() {{}}
+        function hashUrl() {{ return '#/sweeps'; }}
+        const route = {{ value: '/sweeps' }};
+        {_GROUPING_JS}
+        function GroupedList({{ groups, renderGroup }}) {{ return groups.map(renderGroup); }}
+        function useCollapsedGroups() {{ return [() => false, () => {{}}]; }}
+        function FacetSelects(props) {{ return {{ component: 'FacetSelects', props }}; }}
+        function FacetChips(props) {{ return {{ component: 'FacetChips', props }}; }}
+        function GroupBySelect(props) {{ return {{ component: 'GroupBySelect', props }}; }}
+        function SavedViewsMenu(props) {{ return {{ component: 'SavedViewsMenu', props }}; }}
+        function SweepChildren(props) {{ return {{ component: 'SweepChildren', props }}; }}
 
         eval(source + '\\nglobalThis.Sweeps = Sweeps;');
 
@@ -189,7 +205,8 @@ def _sweeps_script(expression: str) -> str:
         function rowIds(rendered) {{
           return collectValues(rendered)
             .filter((value) => typeof value === 'string' && value.startsWith('sweep-row-'))
-            .filter((value) => !value.startsWith('sweep-row-ns-') && !value.startsWith('sweep-row-model-'));
+            .filter((value) => !value.startsWith('sweep-row-ns-') && !value.startsWith('sweep-row-model-')
+              && !value.startsWith('sweep-row-expand-'));
         }}
 
         {expression}

@@ -187,7 +187,8 @@ def test_fetching_effects_have_stable_explicit_dependencies() -> None:
 def test_dashboard_recent_jobs_table_is_bounded_before_render_mapping() -> None:
     dashboard = _source(_UI_ROOT / "pages" / "dashboard.js")
     helpers = _source(_UI_ROOT / "pages" / "dashboard-helpers.js")
-    assert "const recent = recentJobs(allJobs);" in dashboard
+    # The 24 h "finished" table is capped by RECENT_LIMIT *before* run grouping and row mapping.
+    assert "recentJobs(finished, RECENT_LIMIT)" in dashboard
     assert "recent.map((job, i)" in dashboard
     assert "function recentJobs(jobList, limit = 5)" in helpers
     assert "if (top.length > limit) top.pop();" in helpers

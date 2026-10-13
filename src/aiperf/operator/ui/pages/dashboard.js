@@ -4,9 +4,9 @@
 import { html } from 'htm/preact';
 import { useState, useEffect } from 'preact/hooks';
 import { api, poll } from '../lib/api.js';
-import { jobs, clusterInfo, dedupeByNsName } from '../lib/state.js';
+import { jobs, sweeps, clusterInfo, dedupeByNsName } from '../lib/state.js';
 import { phaseColor, modelColor, palette, colors } from '../lib/theme.js';
-import { buildJobPath, navigate } from '../lib/router.js';
+import { buildJobPath, navigate, hashUrl, query, setQuery } from '../lib/router.js';
 import { KpiCard } from '../components/kpi-card.js';
 import { ChartWrapper } from '../components/chart-wrapper.js';
 import { ClusterStatsBanner } from '../components/cluster-stats-banner.js';
@@ -16,8 +16,15 @@ import { LoadingPanel } from '../components/spinner.js';
 import { fmtNumber, fmtInt, fmtThroughput, fmtLatencyStr, fmtMilliseconds, fmtReqPerSecond } from '../lib/format.js';
 import { CHART_TYPOGRAPHY } from '../lib/typography.js';
 import { recentJobs } from './dashboard-helpers.js';
+import { childBadge, deriveRun, facetValues } from '../lib/grouping.js';
+import { ModelCards, dashboardJobs, liveJobs, finishedJobsWithin, groupByRun } from '../components/model-cards.js';
 
 const shortModel = (m) => (m ? String(m).split('/').pop() : null);
+
+// Upper bound on rows in the "Finished in the last 24 h" table; the Jobs page
+// has the rest. A single sweep contributes one row per point, so this is
+// sized for a few sweeps rather than the old five-row "Recent Jobs" table.
+const RECENT_LIMIT = 30;
 
 /**
  * Record-holding run for one field across every completed job.
@@ -237,6 +244,107 @@ function ThroughputLatencyScatter({ completedJobs }) {
   `;
 }
 
+
+/**
+ * One live job: name, sweep badge, run, phase, workers, live metric strip,
+ * progress. Markup is the former inline "Active Jobs" card; the sweep badge
+ * (`childBadge`) and run (`deriveRun`) are the only additions.
+ */
+function LiveJobCard({ job }) {
+  const badge = childBadge(job);
+  const run = deriveRun(job);
+  const phase = job.phase ?? 'Unknown';
+  const pct = Math.round(job.progressPercent ?? 0);
+  const color = phaseColor(phase);
+  const startTime = job.startTime;
+  const workersReady = job.workersReady ?? 0;
+  const workersTotal = job.workersTotal ?? 0;
+  const showWorkers = workersTotal > 0;
+  const errPctValue = job.errorRate != null ? job.errorRate * 100 : null;
+  const errColor = errPctValue == null
+    ? palette.muted
+    : errPctValue >= 5 ? palette.red
+    : errPctValue >= 1 ? palette.amber
+    : palette.green;
+  const liveMetrics = [
+    { label: 'TTFT', value: job.ttftMs, fmt: v => fmtMilliseconds(v), unit: 'ms', help: 'Time To First Token (avg) — latency from request send to first streamed token' },
+    { label: 'OutTok', value: job.outputTokenThroughputTps, fmt: v => fmtInt(v), unit: 'tok/s', help: 'Output token throughput — tokens generated per second across all in-flight requests' },
+    { label: 'P99', value: job.latencyP99Ms, fmt: v => fmtMilliseconds(v), unit: 'ms', help: '99th-percentile end-to-end request latency' },
+    { label: 'ITL', value: job.interTokenLatencyMs, fmt: v => fmtMilliseconds(v), unit: 'ms', help: 'Inter-Token Latency — average time between successive output tokens' },
+    { label: 'Reqs', value: job.totalRequests, fmt: v => fmtInt(v), unit: '', help: 'Total requests issued so far in this run' },
+  ].filter(m => m.value != null);
+
+  const goToJob = () => navigate(buildJobPath(job));
+  return html`
+    <div
+      class="job-card"
+      role="button"
+      tabindex="0"
+      aria-label=${'Open job ' + job.namespace + '/' + job.name}
+      onclick=${goToJob}
+      onkeydown=${e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToJob(); } }}
+      onfocus=${e => { e.currentTarget.style.outline = '2px solid ' + palette.accent; e.currentTarget.style.outlineOffset = '2px'; }}
+      onblur=${e => { e.currentTarget.style.outline = ''; e.currentTarget.style.outlineOffset = ''; }}
+      style="cursor:pointer;margin-bottom:var(--space-3)"
+    >
+      <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:start">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <div class="job-indicator running"></div>
+            <span class="job-name">${job.name}</span>
+            ${badge ? html`<span class="meta-pill" title=${'Sweep child: ' + badge} data-testid="dashboard-sweep-child-badge">${badge}</span>` : null}
+            <span class="job-badge running">${phase}</span>
+            ${job.currentPhase ? html`
+              <span class="job-subphase" title="Current benchmark phase">${job.currentPhase}</span>
+            ` : null}
+            <${NsPill} ns=${job.namespace} onClick=${ns => navigate('/jobs?ns=' + encodeURIComponent(ns))} testId=${'dashboard-active-ns-' + (job.namespace ?? '')} />
+            ${job.model && html`<${ModelPill} model=${job.model} testId=${'dashboard-active-model-' + (job.namespace ?? '')} />`}
+          </div>
+          <div class="text-dim" style="font-size:var(--font-size-sm);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            ${run && run !== job.name ? html`<span title="Run (from labels or the job name)">run <span style="color:${palette.sub}">${run}</span></span>` : null}
+            ${startTime ? html`<${RelativeTime} ts=${startTime} mode="elapsed" />` : null}
+            ${showWorkers ? html`
+              <span title="Workers ready / total">\u00b7
+                <span style="color:${workersReady === workersTotal ? palette.green : palette.amber}">${workersReady}/${workersTotal}</span> workers
+              </span>
+            ` : null}
+          </div>
+        </div>
+        <div style="text-align:right">
+          ${job.throughputRps != null ? html`
+            <div style="font-size: var(--font-size-xl);font-weight:700;color:${palette.text};line-height:1">${fmtThroughput(job.throughputRps)}</div>
+            <div style="font-size: var(--font-size-xs);color:${palette.muted}">req/s</div>
+          ` : null}
+        </div>
+      </div>
+      ${liveMetrics.length > 0 || errPctValue != null ? html`
+        <div class="live-metric-strip" data-testid="dashboard-active-metrics">
+          ${liveMetrics.map(m => html`
+            <div class="live-metric" key=${m.label} title=${m.help + (m.unit ? ' (' + m.unit + ')' : '')}>
+              <span class="live-metric-label">${m.label}</span>
+              <span class="live-metric-value">${m.fmt(m.value)}</span>
+              ${m.unit ? html`<span class="live-metric-unit">${m.unit}</span>` : null}
+            </div>
+          `)}
+          ${errPctValue != null ? html`
+            <div class="live-metric" title=${'Errored requests as % of total — ' + (errPctValue >= 5 ? 'high error rate, investigate' : errPctValue >= 1 ? 'elevated error rate' : 'within tolerance')}>
+              <span class="live-metric-label">Err</span>
+              <span class="live-metric-value" style="color:${errColor}">
+                ${errPctValue >= 5 ? html`<span aria-label="high">! </span>` : null}${fmtNumber(errPctValue, errPctValue < 1 ? 2 : 1)}%
+              </span>
+            </div>
+          ` : null}
+        </div>
+      ` : null}
+      ${pct > 0 ? html`
+        <div class="progress-track" style="margin-top:8px">
+          <div class="progress-fill" style=${'width:' + pct + '%;background:' + color} />
+        </div>
+      ` : null}
+    </div>
+  `;
+}
+
 // --- Main Dashboard ---
 
 /**
@@ -261,6 +369,7 @@ function enrichJobsFromSummaries(jobList, summaryMap) {
 
 export function Dashboard() {
   const [localJobs, setLocalJobs] = useState(jobs.value);
+  const [localSweeps, setLocalSweeps] = useState(sweeps.value);
   const [clusterError, setClusterError] = useState(false);
   const [summaryMap, setSummaryMap] = useState({});
   // Block the dashboard body behind a spinner until the first /jobs
@@ -286,6 +395,12 @@ export function Dashboard() {
         setFirstJobsLoad(false);
       }
     }, 5000, ac.signal, { source: 'jobs' });
+    poll(async () => {
+      const data = await api.listSweeps();
+      const list = dedupeByNsName(data?.sweeps ?? []);
+      sweeps.value = list;
+      setLocalSweeps(list);
+    }, 5000, ac.signal, { source: 'sweeps' });
     poll(async () => {
       try {
         const data = await api.getCluster();
@@ -322,9 +437,25 @@ export function Dashboard() {
   const bestTtft = findMin(allJobs, 'ttftMs');
   const bestTokenTps = findBest(allJobs, 'tokenThroughput');
 
-  const recent = recentJobs(allJobs);
+  // The lists below are scoped to what the cluster is doing now plus the last
+  // 24 h; the record tiles and the scatter above keep the all-time view.
+  const now = Date.now();
+  const modelFilter = query.value.model ?? '';
+  const windowJobs = dashboardJobs(allJobs, now);
+  const modelOptions = facetValues(windowJobs, 'model');
+  if (modelFilter && !modelOptions.includes(modelFilter)) modelOptions.push(modelFilter);
+  const scopedJobs = modelFilter ? windowJobs.filter(j => j.model === modelFilter) : windowJobs;
+  const scopedSweeps = modelFilter ? localSweeps.filter(s => s?.model === modelFilter) : localSweeps;
+  const live = liveJobs(scopedJobs);
+  const finished = finishedJobsWithin(scopedJobs, now);
+  // Newest first, then regrouped so each run's points sit together under one
+  // header row (groups keep newest-first order via first appearance).
+  const runGroups = groupByRun(recentJobs(finished, RECENT_LIMIT), deriveRun);
+  const recent = runGroups.flatMap(g => g.items);
   const maxThroughput = recent.reduce((mx, j) => Math.max(mx, j.throughputRps ?? 0), 0) || 1;
-  const maxLatency = recent.reduce((mx, j) => Math.max(mx, j.latencyP99Ms ?? 0), 0) || 1;
+  // hashUrl() encodes the query for us; navigate() wants the path without '#'.
+  const openModel = (model) => navigate(hashUrl('/jobs', { model, group: 'run' }).slice(1));
+  const clearModel = () => setQuery({ model: undefined });
 
   if (firstJobsLoad) {
     return html`
@@ -371,116 +502,149 @@ export function Dashboard() {
           </p>
         </div>
       ` : html`
-      <!-- Section 4: Active Jobs -->
-      <div class="section-header" style="margin-top:var(--space-6)">
-        <span class="section-title">Active Jobs</span>
-        <span class="text-dim" style="font-size: var(--font-size-sm)">
-          ${running.length} job${running.length !== 1 ? 's' : ''}
-        </span>
+      <!-- Section 4: Models, running now, finished in the last 24 h -->
+      <div class="section-header" style="margin-top:var(--space-6);flex-wrap:wrap;gap:8px">
+        <span class="section-title">Models</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="text-dim" style="font-size: var(--font-size-sm)" data-testid="dashboard-window-summary">
+            ${live.length} running · ${finished.length} finished in 24 h
+          </span>
+          ${modelOptions.length > 0 ? html`
+            <select
+              class="ui-select"
+              aria-label="Filter dashboard by model"
+              data-testid="dashboard-model-select"
+              value=${modelFilter}
+              onchange=${e => setQuery({ model: e.target.value })}
+            >
+              <option value="">All models</option>
+              ${modelOptions.map(m => html`<option key=${m} value=${m}>${m}</option>`)}
+            </select>
+          ` : null}
+        </div>
       </div>
 
-      ${running.length === 0
-        ? html`
-          <div class="empty-state card">
-            <p class="text-dim" style="margin:0">
-              ${completed.length > 0
-                ? html`No active jobs. ${completed.length} completed run${completed.length === 1 ? '' : 's'} below — start another with <code>aiperf kube run</code>.`
-                : html`No active jobs. Start a benchmark with <code>aiperf kube run</code>.`}
-            </p>
-          </div>
-        `
-        : running.map(job => {
-            const phase = job.phase ?? 'Unknown';
-            const pct = Math.round(job.progressPercent ?? 0);
-            const color = phaseColor(phase);
-            const startTime = job.startTime;
-            const workersReady = job.workersReady ?? 0;
-            const workersTotal = job.workersTotal ?? 0;
-            const showWorkers = workersTotal > 0;
-            const errPctValue = job.errorRate != null ? job.errorRate * 100 : null;
-            const errColor = errPctValue == null
-              ? palette.muted
-              : errPctValue >= 5 ? palette.red
-              : errPctValue >= 1 ? palette.amber
-              : palette.green;
-            const liveMetrics = [
-              { label: 'TTFT', value: job.ttftMs, fmt: v => fmtMilliseconds(v), unit: 'ms', help: 'Time To First Token (avg) — latency from request send to first streamed token' },
-              { label: 'OutTok', value: job.outputTokenThroughputTps, fmt: v => fmtInt(v), unit: 'tok/s', help: 'Output token throughput — tokens generated per second across all in-flight requests' },
-              { label: 'P99', value: job.latencyP99Ms, fmt: v => fmtMilliseconds(v), unit: 'ms', help: '99th-percentile end-to-end request latency' },
-              { label: 'ITL', value: job.interTokenLatencyMs, fmt: v => fmtMilliseconds(v), unit: 'ms', help: 'Inter-Token Latency — average time between successive output tokens' },
-              { label: 'Reqs', value: job.totalRequests, fmt: v => fmtInt(v), unit: '', help: 'Total requests issued so far in this run' },
-            ].filter(m => m.value != null);
+      <${ModelCards} jobs=${scopedJobs} sweeps=${scopedSweeps} onOpen=${openModel} now=${now} />
 
-            const goToJob = () => navigate(buildJobPath(job));
-            return html`
-              <div
-                key=${job.namespace + '/' + job.name}
-                class="job-card"
-                role="button"
-                tabindex="0"
-                aria-label=${'Open job ' + job.namespace + '/' + job.name}
-                onclick=${goToJob}
-                onkeydown=${e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToJob(); } }}
-                onfocus=${e => { e.currentTarget.style.outline = '2px solid ' + palette.accent; e.currentTarget.style.outlineOffset = '2px'; }}
-                onblur=${e => { e.currentTarget.style.outline = ''; e.currentTarget.style.outlineOffset = ''; }}
-                style="cursor:pointer;margin-bottom:var(--space-3)"
-              >
-                <div style="display:grid;grid-template-columns:1fr auto;gap:8px;align-items:start">
-                  <div>
-                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                      <div class="job-indicator running"></div>
-                      <span class="job-name">${job.name}</span>
-                      <span class="job-badge running">${phase}</span>
-                      ${job.currentPhase ? html`
-                        <span class="job-subphase" title="Current benchmark phase">${job.currentPhase}</span>
-                      ` : null}
-                      <${NsPill} ns=${job.namespace} onClick=${ns => navigate('/jobs?ns=' + encodeURIComponent(ns))} testId=${'dashboard-active-ns-' + (job.namespace ?? '')} />
-                      ${job.model && html`<${ModelPill} model=${job.model} testId=${'dashboard-active-model-' + (job.namespace ?? '')} />`}
-                    </div>
-                    <div class="text-dim" style="font-size:var(--font-size-sm);margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-                      ${startTime ? html`<${RelativeTime} ts=${startTime} mode="elapsed" />` : null}
-                      ${showWorkers ? html`
-                        <span title="Workers ready / total">\u00b7
-                          <span style="color:${workersReady === workersTotal ? palette.green : palette.amber}">${workersReady}/${workersTotal}</span> workers
-                        </span>
-                      ` : null}
-                    </div>
-                  </div>
-                  <div style="text-align:right">
-                    ${job.throughputRps != null ? html`
-                      <div style="font-size: var(--font-size-xl);font-weight:700;color:${palette.text};line-height:1">${fmtThroughput(job.throughputRps)}</div>
-                      <div style="font-size: var(--font-size-xs);color:${palette.muted}">req/s</div>
-                    ` : null}
-                  </div>
-                </div>
-                ${liveMetrics.length > 0 || errPctValue != null ? html`
-                  <div class="live-metric-strip" data-testid="dashboard-active-metrics">
-                    ${liveMetrics.map(m => html`
-                      <div class="live-metric" key=${m.label} title=${m.help + (m.unit ? ' (' + m.unit + ')' : '')}>
-                        <span class="live-metric-label">${m.label}</span>
-                        <span class="live-metric-value">${m.fmt(m.value)}</span>
-                        ${m.unit ? html`<span class="live-metric-unit">${m.unit}</span>` : null}
-                      </div>
-                    `)}
-                    ${errPctValue != null ? html`
-                      <div class="live-metric" title=${'Errored requests as % of total — ' + (errPctValue >= 5 ? 'high error rate, investigate' : errPctValue >= 1 ? 'elevated error rate' : 'within tolerance')}>
-                        <span class="live-metric-label">Err</span>
-                        <span class="live-metric-value" style="color:${errColor}">
-                          ${errPctValue >= 5 ? html`<span aria-label="high">! </span>` : null}${fmtNumber(errPctValue, errPctValue < 1 ? 2 : 1)}%
-                        </span>
-                      </div>
-                    ` : null}
-                  </div>
-                ` : null}
-                ${pct > 0 ? html`
-                  <div class="progress-track" style="margin-top:8px">
-                    <div class="progress-fill" style=${'width:' + pct + '%;background:' + color} />
-                  </div>
-                ` : null}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:var(--space-4);margin-top:var(--space-4);align-items:start">
+        <div data-testid="dashboard-running-column">
+          <div class="section-header" style="margin-bottom:var(--space-2)">
+            <span class="section-title" style="font-size:var(--font-size-sm)">Running now</span>
+            <span class="text-dim" style="font-size: var(--font-size-xs)">
+              ${live.length} job${live.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+          ${live.length === 0
+            ? html`
+              <div class="empty-state card" style="padding:var(--space-4)" data-testid="dashboard-running-empty">
+                <p class="text-dim" style="margin:0">
+                  ${finished.length > 0
+                    ? html`No active jobs. ${finished.length} finished in the last 24 h — start another with <code>aiperf kube run</code>.`
+                    : modelFilter
+                      ? html`No active jobs for this model. <button type="button" class="nav-tab" onclick=${clearModel} style="font-size:var(--font-size-xs);padding:2px 8px">Clear filter</button>`
+                      : html`No active jobs. Start a benchmark with <code>aiperf kube run</code>.`}
+                </p>
               </div>
-            `;
-          })
-      }
+            `
+            : live.map(job => html`<${LiveJobCard} key=${job.namespace + '/' + job.name} job=${job} />`)}
+        </div>
+
+        <div data-testid="dashboard-finished-column">
+          <div class="section-header" style="margin-bottom:var(--space-2)">
+            <span class="section-title" style="font-size:var(--font-size-sm)">Finished in the last 24 h</span>
+            <button type="button" class="nav-tab" onclick=${() => navigate('/jobs')} style="font-size: var(--font-size-xs);padding:4px 10px;">View All →</button>
+          </div>
+          ${recent.length === 0 ? html`
+            <div class="empty-state card" style="padding:var(--space-4)" data-testid="dashboard-finished-empty">
+              <p class="text-dim" style="margin:0">
+                Nothing finished in the last 24 h${modelFilter ? ' for this model' : ''}. Older runs are on the
+                <button type="button" class="nav-tab" onclick=${() => navigate('/jobs')} style="font-size:var(--font-size-xs);padding:2px 8px">Jobs</button> page.
+              </p>
+            </div>
+          ` : html`
+            <table class="compare-table" data-testid="dashboard-finished-table">
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th style="width:96px">Phase</th>
+                  <th style="width:160px">Throughput</th>
+                  <th style="text-align:right">TTFT</th>
+                  <th style="text-align:right">Out tok/s</th>
+                  <th style="text-align:right">Finished</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${recent.map((job, i) => {
+                  const run = deriveRun(job);
+                  const newRun = i === 0 || deriveRun(recent[i - 1]) !== run;
+                  const group = newRun ? runGroups.find(g => g.run === run) : null;
+                  const tpsVal = job.throughputRps ?? 0;
+                  const tpsPct = maxThroughput > 0 ? (tpsVal / maxThroughput) * 100 : 0;
+                  const mColor = modelColor(job.model);
+                  const goToLb = () => navigate(buildJobPath(job));
+                  const phase = job.phase ?? 'Unknown';
+                  const phaseClr = phaseColor(phase);
+                  const endedTs = job.completionTime ?? job.created ?? job.startTime ?? null;
+                  const outTokTps = job.outputTokenThroughputTps ?? job.tokenThroughput ?? null;
+                  const badge = childBadge(job);
+
+                  return html`
+                    ${group ? html`
+                      <tr key=${'run:' + run} data-testid=${'dashboard-run-header-' + run}>
+                        <td colspan="6" style="padding:8px 8px 4px 8px;font-size:var(--font-size-xs);color:${palette.sub};border-bottom:1px solid ${palette.border}">
+                          <span style="font-weight:600;color:${palette.text}">${run}</span>
+                          <span class="text-dim"> · ${group.items.length} job${group.items.length === 1 ? '' : 's'}</span>
+                          ${group.failed > 0 ? html`<span style="color:${palette.red}"> · ${group.failed} failed</span>` : null}
+                          ${job.model ? html`<span class="text-dim" title=${job.model}> · ${shortModel(job.model)}</span>` : null}
+                        </td>
+                      </tr>
+                    ` : null}
+                    <tr
+                      key=${job.namespace + '/' + job.name}
+                      role="button"
+                      tabindex="0"
+                      aria-label=${'Open job ' + job.namespace + '/' + job.name}
+                      onclick=${goToLb}
+                      onkeydown=${e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToLb(); } }}
+                      onfocus=${e => { e.currentTarget.style.outline = '2px solid ' + palette.accent; e.currentTarget.style.outlineOffset = '-2px'; }}
+                      onblur=${e => { e.currentTarget.style.outline = ''; e.currentTarget.style.outlineOffset = ''; }}
+                      style="cursor:pointer"
+                    >
+                      <td>
+                        <div class="model-cell">
+                          <span class="model-color" style="background:${mColor}"></span>
+                          <span
+                            class="model-name"
+                            title=${(job.model ?? job.name) + ' — ' + job.namespace + '/' + job.name}
+                            style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px;display:inline-block;vertical-align:middle"
+                          >${job.name}</span>
+                          ${badge ? html`<span class="meta-pill" title=${'Sweep child: ' + badge} style="margin-left:4px">${badge}</span>` : null}
+                        </div>
+                      </td>
+                      <td>
+                        <span class="phase-badge" style=${'background: ' + phaseClr + '22; color: ' + phaseClr + '; border-color: ' + phaseClr + '44'}>${phase}</span>
+                      </td>
+                      <td title=${BAR_SCALE_HINT}>
+                        <div class="bar-cell">
+                          <div class="inline-bar">
+                            <div class="inline-bar-fill" style="width:${tpsPct}%;background:${palette.accent}"></div>
+                          </div>
+                          <span class="bar-val">${job.throughputRps != null ? fmtThroughput(tpsVal) + ' req/s' : '---'}</span>
+                        </div>
+                      </td>
+                      <td style="text-align:right;font-variant-numeric:tabular-nums">${job.ttftMs != null ? fmtMilliseconds(job.ttftMs) + ' ms' : '---'}</td>
+                      <td style="text-align:right;font-variant-numeric:tabular-nums">${outTokTps != null ? fmtInt(outTokTps) : '---'}</td>
+                      <td style="text-align:right;font-variant-numeric:tabular-nums" class="text-dim">
+                        ${endedTs ? html`<${RelativeTime} ts=${endedTs} suffix="ago" />` : '---'}
+                      </td>
+                    </tr>
+                  `;
+                })}
+              </tbody>
+            </table>
+          `}
+        </div>
+      </div>
 
       <${ThroughputLatencyScatter} completedJobs=${completed} />
 
@@ -498,95 +662,6 @@ export function Dashboard() {
         <span title="99th-percentile end-to-end request latency (lower is better)">P99</span> = 99th-percentile latency.
       </div>
 
-
-      <!-- Section 5: Recent Jobs -->
-      ${recent.length > 0 ? html`
-        <div class="section-header" style="margin-top:var(--space-6)">
-          <div class="section-title">Recent Jobs</div>
-          <button type="button" class="nav-tab" onclick=${() => navigate('/jobs')} style="font-size: var(--font-size-xs);padding:4px 10px;">View All \u2192</button>
-        </div>
-        <table class="compare-table">
-          <thead>
-            <tr>
-              <th style="width:40px;text-align:right">#</th>
-              <th>Configuration</th>
-              <th style="width:120px">Phase</th>
-              <th style="width:200px">Throughput</th>
-              <th style="width:200px">Latency P99</th>
-              <th style="text-align:right">TTFT</th>
-              <th style="text-align:right">Output Tok/s</th>
-              <th style="text-align:right">Reqs</th>
-              <th style="text-align:right">Started</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${recent.map((job, i) => {
-              const tpsVal = job.throughputRps ?? 0;
-              const latVal = job.latencyP99Ms ?? 0;
-              const tpsPct = maxThroughput > 0 ? (tpsVal / maxThroughput) * 100 : 0;
-              const latPct = maxLatency > 0 ? (latVal / maxLatency) * 100 : 0;
-              const mColor = modelColor(job.model);
-              const goToLb = () => navigate(buildJobPath(job));
-              const phase = job.phase ?? 'Unknown';
-              const phaseClr = phaseColor(phase);
-              const startedTs = job.created ?? job.startTime ?? null;
-              const outTokTps = job.outputTokenThroughputTps ?? job.tokenThroughput ?? null;
-              const reqs = job.totalRequests ?? null;
-
-              return html`
-                <tr
-                  key=${job.namespace + '/' + job.name}
-                  role="button"
-                  tabindex="0"
-                  aria-label=${'Open job ' + job.namespace + '/' + job.name}
-                  onclick=${goToLb}
-                  onkeydown=${e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToLb(); } }}
-                  onfocus=${e => { e.currentTarget.style.outline = '2px solid ' + palette.accent; e.currentTarget.style.outlineOffset = '-2px'; }}
-                  onblur=${e => { e.currentTarget.style.outline = ''; e.currentTarget.style.outlineOffset = ''; }}
-                  style="cursor:pointer"
-                >
-                  <td><span class="rank">${i + 1}</span></td>
-                  <td>
-                    <div class="model-cell">
-                      <span class="model-color" style="background:${mColor}"></span>
-                      <span
-                        class="model-name"
-                        title=${(job.model ?? job.name) + ' — ' + job.namespace + '/' + job.name}
-                        style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px;display:inline-block;vertical-align:middle"
-                      >${job.model ?? job.name}</span>
-                    </div>
-                  </td>
-                  <td>
-                    <span class="phase-badge" style=${'background: ' + phaseClr + '22; color: ' + phaseClr + '; border-color: ' + phaseClr + '44'}>${phase}</span>
-                  </td>
-                  <td title=${BAR_SCALE_HINT}>
-                    <div class="bar-cell">
-                      <div class="inline-bar">
-                        <div class="inline-bar-fill" style="width:${tpsPct}%;background:${palette.accent}"></div>
-                      </div>
-                      <span class="bar-val">${job.throughputRps != null ? fmtThroughput(tpsVal) + ' req/s' : '---'}</span>
-                    </div>
-                  </td>
-                  <td title=${BAR_SCALE_HINT}>
-                    <div class="bar-cell">
-                      <div class="inline-bar">
-                        <div class="inline-bar-fill" style="width:${latPct}%;background:${palette.cyan}"></div>
-                      </div>
-                      <span class="bar-val">${job.latencyP99Ms != null ? fmtMilliseconds(latVal) + ' ms' : '---'}</span>
-                    </div>
-                  </td>
-                  <td style="text-align:right;font-variant-numeric:tabular-nums">${job.ttftMs != null ? fmtMilliseconds(job.ttftMs) + ' ms' : '---'}</td>
-                  <td style="text-align:right;font-variant-numeric:tabular-nums">${outTokTps != null ? fmtInt(outTokTps) : '---'}</td>
-                  <td style="text-align:right;font-variant-numeric:tabular-nums">${reqs != null ? fmtInt(reqs) : '---'}</td>
-                  <td style="text-align:right;font-variant-numeric:tabular-nums" class="text-dim">
-                    ${startedTs ? html`<${RelativeTime} ts=${startedTs} />` : '---'}
-                  </td>
-                </tr>
-              `;
-            })}
-          </tbody>
-        </table>
-      ` : null}
       `}
     </div>
   `;

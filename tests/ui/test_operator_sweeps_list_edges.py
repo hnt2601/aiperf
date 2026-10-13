@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.ui.node_utils import run_node
+from tests.ui.node_utils import local_module_js, run_node
 
 _SWEEPS_PAGE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -18,6 +18,10 @@ _SWEEPS_PAGE_PATH = (
     / "pages"
     / "sweeps.js"
 )
+
+# lib/grouping.js is import-free; splice the real helpers so facet filters,
+# label badges and grouping run against the browser's code, not a stub.
+_GROUPING_JS = local_module_js("lib/grouping.js")
 
 
 def _node_script(expression: str) -> str:
@@ -69,6 +73,20 @@ def _node_script(expression: str) -> str:
         function FreshnessPill(props) {{ return {{ component: 'FreshnessPill', props }}; }}
         function StaleBanner(props) {{ return {{ component: 'StaleBanner', props }}; }}
         function LoadingPanel(props) {{ return {{ component: 'LoadingPanel', props }}; }}
+        const jobs = {{ value: [] }};
+        function replaceRoute() {{}}
+        function hashUrl() {{ return '#/sweeps'; }}
+        const route = {{ value: '/sweeps' }};
+        {_GROUPING_JS}
+        // GroupedList is a plain render function in the page; the stub keeps
+        // every group's rows in the tree so rowIds() sees them in group order.
+        function GroupedList({{ groups, renderGroup }}) {{ return groups.map(renderGroup); }}
+        function useCollapsedGroups() {{ return [() => false, () => {{}}]; }}
+        function FacetSelects(props) {{ return {{ component: 'FacetSelects', props }}; }}
+        function FacetChips(props) {{ return {{ component: 'FacetChips', props }}; }}
+        function GroupBySelect(props) {{ return {{ component: 'GroupBySelect', props }}; }}
+        function SavedViewsMenu(props) {{ return {{ component: 'SavedViewsMenu', props }}; }}
+        function SweepChildren(props) {{ return {{ component: 'SweepChildren', props }}; }}
 
         eval(source + '\\nglobalThis.Sweeps = Sweeps;');
 
@@ -116,7 +134,13 @@ def _node_script(expression: str) -> str:
         function rowIds(rendered) {{
           return collectValues(rendered)
             .filter((value) => typeof value === 'string' && value.startsWith('sweep-row-'))
-            .filter((value) => !value.startsWith('sweep-row-ns-') && !value.startsWith('sweep-row-model-'));
+            .filter((value) => !value.startsWith('sweep-row-ns-') && !value.startsWith('sweep-row-model-')
+              && !value.startsWith('sweep-row-expand-'));
+        }}
+
+        function testIds(rendered, prefix) {{
+          return collectValues(rendered)
+            .filter((value) => typeof value === 'string' && value.startsWith(prefix));
         }}
 
         function components(rendered, name) {{
@@ -290,3 +314,148 @@ def test_sweeps_page_uses_shared_freshness_source_and_stale_banner() -> None:
     assert "source: 'sweeps'" in source
     assert '<${StaleBanner} source=${sweepsFreshness} label="Sweeps list" />' in source
     assert "<${FreshnessPill} source=${sweepsFreshness}" in source
+
+
+_LABELLED_SWEEPS = [
+    {
+        "namespace": "perfledger",
+        "name": "gemma4-cap-e5dea4",
+        "phase": "Running",
+        "model": "gemma-4",
+        "age_seconds": 30,
+        "labels": {
+            "perfledger.fptcloud.vn/run": "gemma4-cap",
+            "perfledger.fptcloud.vn/scenario": "agentx-ref",
+            "perfledger.fptcloud.vn/lifecycle": "gateway",
+        },
+    },
+    {
+        "namespace": "perfledger",
+        "name": "gemma4-pilot-ab12cd",
+        "phase": "Succeeded",
+        "model": "gemma-4",
+        "age_seconds": 600,
+        "labels": {
+            "perfledger.fptcloud.vn/run": "gemma4-pilot",
+            "perfledger.fptcloud.vn/scenario": "fixed_seq_ref",
+            "perfledger.fptcloud.vn/lifecycle": "internal",
+            "perfledger.fptcloud.vn/pilot": "true",
+        },
+    },
+    {
+        "namespace": "team-b",
+        "name": "qwen-cap-123abc",
+        "phase": "Failed",
+        "model": "qwen3",
+        "age_seconds": 120,
+        "labels": {"perfledger.fptcloud.vn/scenario": "agentx-ref"},
+    },
+]
+
+
+def test_facet_filters_and_search_use_labels_and_name_convention() -> None:
+    script = _node_script(
+        f"""
+        const rows = {json.dumps(_LABELLED_SWEEPS)};
+        const out = {{
+          run: rowIds(renderSweeps({{ rows, q: {{ run: 'gemma4-cap', group: 'none' }} }})),
+          scenario: rowIds(renderSweeps({{ rows, q: {{ scenario: 'agentx-ref', group: 'none', sort: 'name:asc' }} }})),
+          lifecycleAndPhase: rowIds(renderSweeps({{ rows, q: {{ lifecycle: 'internal', phase: 'completed', group: 'none' }} }})),
+          searchRun: rowIds(renderSweeps({{ rows, q: {{ q: 'qwen-cap', group: 'none' }} }})),
+          searchScenario: rowIds(renderSweeps({{ rows, q: {{ q: 'FIXED_SEQ', group: 'none' }} }})),
+        }};
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    assert json.loads(run_node(script)) == {
+        "run": ["sweep-row-perfledger-gemma4-cap-e5dea4"],
+        "scenario": ["sweep-row-perfledger-gemma4-cap-e5dea4", "sweep-row-team-b-qwen-cap-123abc"],
+        "lifecycleAndPhase": ["sweep-row-perfledger-gemma4-pilot-ab12cd"],
+        "searchRun": ["sweep-row-team-b-qwen-cap-123abc"],
+        "searchScenario": ["sweep-row-perfledger-gemma4-pilot-ab12cd"],
+    }
+
+
+def test_grouping_defaults_to_model_and_keeps_sort_order_inside_each_group() -> None:
+    script = _node_script(
+        f"""
+        const rows = {json.dumps(_LABELLED_SWEEPS)};
+        const out = {{
+          byModel: rowIds(renderSweeps({{ rows }})),
+          byRun: rowIds(renderSweeps({{ rows, q: {{ group: 'run' }} }})),
+          byScenarioNameAsc: rowIds(renderSweeps({{ rows, q: {{ group: 'scenario', sort: 'name:asc' }} }})),
+          sweepKeyFallsBackToFlat: rowIds(renderSweeps({{ rows, q: {{ group: 'sweep' }} }})),
+          flat: rowIds(renderSweeps({{ rows, q: {{ group: 'none' }} }})),
+          groupSelectWired: flattenText(renderSweeps({{ rows }})).includes('sweeps-group-select'),
+        }};
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    out = json.loads(run_node(script))
+    # No started_at on these rows, so groups order by key; rows inside a group
+    # keep the page sort (default: newest first).
+    assert out["byModel"] == [
+        "sweep-row-perfledger-gemma4-cap-e5dea4",
+        "sweep-row-perfledger-gemma4-pilot-ab12cd",
+        "sweep-row-team-b-qwen-cap-123abc",
+    ]
+    assert out["byRun"] == [
+        "sweep-row-perfledger-gemma4-cap-e5dea4",
+        "sweep-row-perfledger-gemma4-pilot-ab12cd",
+        "sweep-row-team-b-qwen-cap-123abc",
+    ]
+    assert out["byScenarioNameAsc"] == [
+        "sweep-row-perfledger-gemma4-cap-e5dea4",
+        "sweep-row-team-b-qwen-cap-123abc",
+        "sweep-row-perfledger-gemma4-pilot-ab12cd",
+    ]
+    assert out["sweepKeyFallsBackToFlat"] == out["flat"]
+    assert out["flat"] == [
+        "sweep-row-perfledger-gemma4-cap-e5dea4",
+        "sweep-row-team-b-qwen-cap-123abc",
+        "sweep-row-perfledger-gemma4-pilot-ab12cd",
+    ]
+    assert out["groupSelectWired"] is True
+
+
+def test_rows_expose_expand_controls_and_label_badges_without_inventing_trials() -> None:
+    script = _node_script(
+        f"""
+        const rows = {json.dumps(_LABELLED_SWEEPS)};
+        const rendered = renderSweeps({{ rows, q: {{ group: 'none', sort: 'name:asc' }} }});
+        const out = {{
+          expand: testIds(rendered, 'sweep-row-expand-'),
+          badges: testIds(rendered, 'sweep-badge-'),
+          children: components(rendered, 'SweepChildren').length,
+          text: flattenText(rendered),
+        }};
+        console.log(JSON.stringify(out));
+        """
+    )
+
+    out = json.loads(run_node(script))
+    assert out["expand"] == [
+        "sweep-row-expand-gemma4-cap-e5dea4",
+        "sweep-row-expand-gemma4-pilot-ab12cd",
+        "sweep-row-expand-qwen-cap-123abc",
+    ]
+    assert out["badges"] == [
+        "sweep-badge-lifecycle-gemma4-cap-e5dea4",
+        "sweep-badge-lifecycle-gemma4-pilot-ab12cd",
+        "sweep-badge-pilot-gemma4-pilot-ab12cd",
+    ]
+    # Nothing is expanded until the user asks, and no trial count is shown
+    # because the list payload does not carry one.
+    assert out["children"] == 0
+    assert "trials" not in out["text"]
+
+    source = _SWEEPS_PAGE_PATH.read_text(encoding="utf-8")
+    assert "data-testid=${'sweep-row-expand-' + (s.name ?? '')}" in source
+    assert "aria-expanded=${isOpen}" in source
+    assert "onclick=${(e) => { e.stopPropagation(); onToggleExpand(s); }}" in source
+    assert "<${SweepChildren} namespace=${s.namespace} name=${s.name} phaseOf=${phaseOf} />" in source
+    assert 'testid="sweeps-group-select"' in source
+    assert "const SWEEP_GROUP_KEYS = ['none', 'model', 'run', 'scenario'];" in source
+    assert '<${SavedViewsMenu} page="sweeps" />' in source

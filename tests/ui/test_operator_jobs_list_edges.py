@@ -7,12 +7,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.ui.node_utils import run_node
+from tests.ui.node_utils import local_module_js, run_node
 
 UI_ROOT = Path(__file__).resolve().parents[2] / "src" / "aiperf" / "operator" / "ui"
 JOBS_PAGE_PATH = UI_ROOT / "pages" / "jobs.js"
 JOB_TABLE_PATH = UI_ROOT / "components" / "job-table.js"
 ROUTER_PATH = UI_ROOT / "lib" / "router.js"
+FACET_FILTERS_PATH = UI_ROOT / "components" / "facet-filters.js"
+
+# lib/grouping.js is import-free, so the real helpers are spliced into the
+# page harness instead of being stubbed: the page's facet filters, search and
+# default grouping are exercised against the same code the browser runs.
+GROUPING_JS = local_module_js("lib/grouping.js")
 
 
 def _job_table_script(expression: str) -> str:
@@ -100,8 +106,37 @@ def _jobs_page_script(
         function FreshnessPill() {{}}
         function StaleBanner() {{}}
         function LoadingPanel() {{}}
+        function replaceRoute() {{}}
+        function hashUrl() {{ return '#/jobs'; }}
+        const route = {{ value: '/jobs' }};
+        {GROUPING_JS}
+        // GroupedList is a plain render function in the page; the stub keeps
+        // group bodies in the tree so tests can see which jobs each holds.
+        function GroupedList({{ groups, renderGroup }}) {{ return groups.map(renderGroup); }}
+        function JobGroupBody() {{}}
+        function useCollapsedGroups() {{ return [() => false, () => {{}}]; }}
+        function FacetSelects() {{}}
+        function FacetChips() {{}}
+        function GroupBySelect() {{}}
+        function SavedViewsMenu() {{}}
 
         eval(source + '\\nglobalThis.Jobs = Jobs;');
+
+        // Jobs rendered inside grouped bodies: [[name, ...], ...] per group.
+        function groupBodies(node, out = []) {{
+          if (node == null || node === false) return out;
+          if (Array.isArray(node)) {{
+            for (const item of node) groupBodies(item, out);
+            return out;
+          }}
+          if (typeof node === 'object' && node.__html) {{
+            for (let i = 0; i < node.values.length; i++) {{
+              if (node.values[i] === JobGroupBody) out.push(node.values[i + 1].map((job) => job.name));
+            }}
+            for (const value of node.values) groupBodies(value, out);
+          }}
+          return out;
+        }}
 
         function findJobTableJobs(node) {{
           if (node == null || node === false) return null;
@@ -320,3 +355,160 @@ def test_jobs_page_uses_shared_freshness_source_and_stale_banner() -> None:
     assert "source: 'jobs'" in source
     assert '<${StaleBanner} source=${jobsFreshness} label="Jobs list" />' in source
     assert "<${FreshnessPill} source=${jobsFreshness}" in source
+
+
+_LABELLED_JOBS = [
+    {
+        "namespace": "perfledger",
+        "name": "gemma4-pilot-1-c4-ab12cd",
+        "phase": "Completed",
+        "model": "gemma-4",
+        "labels": {
+            "perfledger.fptcloud.vn/run": "gemma4-pilot-1",
+            "perfledger.fptcloud.vn/scenario": "fixed_seq_ref",
+            "perfledger.fptcloud.vn/lifecycle": "gateway",
+            "perfledger.fptcloud.vn/deploy": "gemma-4-26b",
+        },
+    },
+    {
+        "namespace": "perfledger",
+        "name": "gemma4-pilot-1-c16-ab12cd",
+        "phase": "Running",
+        "model": "gemma-4",
+        "labels": {
+            "perfledger.fptcloud.vn/run": "gemma4-pilot-1",
+            "perfledger.fptcloud.vn/scenario": "fixed_seq_ref",
+            "perfledger.fptcloud.vn/lifecycle": "internal",
+        },
+    },
+    {
+        "namespace": "perfledger",
+        "name": "qwen-cap-e5dea4-v00",
+        "phase": "Completed",
+        "model": "qwen3",
+        "sweepName": "qwen-cap-e5dea4",
+        "variationIndex": 0,
+        "labels": {"perfledger.fptcloud.vn/scenario": "agentx-ref"},
+    },
+    {"namespace": "team-b", "name": "adhoc", "phase": "Failed", "model": "qwen3"},
+]
+
+
+def test_jobs_page_facet_filters_from_url_stack_with_existing_filters() -> None:
+    script = _jobs_page_script(
+        _LABELLED_JOBS,
+        {"run": "gemma4-pilot-1", "group": "none"},
+        """
+        const out = { run: renderedJobs.map((job) => job.name) };
+        query.value = { run: 'gemma4-pilot-1', lifecycle: 'gateway', group: 'none' };
+        out.runAndLifecycle = findJobTableJobs(Jobs()).map((job) => job.name);
+        query.value = { scenario: 'agentx-ref', group: 'none' };
+        out.scenario = findJobTableJobs(Jobs()).map((job) => job.name);
+        query.value = { deploy: 'gemma-4-26b', phase: 'running', group: 'none' };
+        out.deployAndPhase = (findJobTableJobs(Jobs()) ?? []).map((job) => job.name);
+        query.value = { run: 'nope', group: 'none' };
+        out.unknownRun = (findJobTableJobs(Jobs()) ?? []).map((job) => job.name);
+        console.log(JSON.stringify(out));
+        """,
+    )
+
+    assert json.loads(run_node(script)) == {
+        "run": ["gemma4-pilot-1-c4-ab12cd", "gemma4-pilot-1-c16-ab12cd"],
+        "runAndLifecycle": ["gemma4-pilot-1-c4-ab12cd"],
+        "scenario": ["qwen-cap-e5dea4-v00"],
+        "deployAndPhase": [],
+        "unknownRun": [],
+    }
+
+
+def test_jobs_page_search_matches_run_scenario_and_sweep_name() -> None:
+    script = _jobs_page_script(
+        _LABELLED_JOBS,
+        {"q": "pilot", "group": "none"},
+        """
+        const out = { run: renderedJobs.map((job) => job.name) };
+        query.value = { q: 'AGENTX', group: 'none' };
+        out.scenario = findJobTableJobs(Jobs()).map((job) => job.name);
+        query.value = { q: 'qwen-cap-e5dea4', group: 'none' };
+        out.sweep = findJobTableJobs(Jobs()).map((job) => job.name);
+        console.log(JSON.stringify(out));
+        """,
+    )
+
+    assert json.loads(run_node(script)) == {
+        "run": ["gemma4-pilot-1-c4-ab12cd", "gemma4-pilot-1-c16-ab12cd"],
+        "scenario": ["qwen-cap-e5dea4-v00"],
+        "sweep": ["qwen-cap-e5dea4-v00"],
+    }
+
+
+def test_jobs_page_groups_by_model_by_default_and_flat_when_one_model_or_forced() -> (
+    None
+):
+    script = _jobs_page_script(
+        _LABELLED_JOBS,
+        {},
+        """
+        const out = {};
+        let tree = Jobs();
+        out.defaultFlat = findJobTableJobs(tree) != null;
+        out.defaultGroups = groupBodies(tree);
+        query.value = { model: 'qwen3' };
+        tree = Jobs();
+        out.oneModelFlat = findJobTableJobs(tree).map((job) => job.name);
+        out.oneModelGroups = groupBodies(tree);
+        query.value = { group: 'none' };
+        out.forcedFlat = findJobTableJobs(Jobs()).map((job) => job.name).length;
+        query.value = { group: 'run' };
+        out.byRun = groupBodies(Jobs());
+        query.value = { group: 'sweep' };
+        out.bySweep = groupBodies(Jobs());
+        query.value = { group: 'bogus' };
+        out.bogus = groupBodies(Jobs()).length;
+        console.log(JSON.stringify(out));
+        """,
+    )
+
+    assert json.loads(run_node(script)) == {
+        "defaultFlat": False,
+        # Two models -> grouped; no start times so groups fall back to key order.
+        "defaultGroups": [
+            ["gemma4-pilot-1-c4-ab12cd", "gemma4-pilot-1-c16-ab12cd"],
+            ["qwen-cap-e5dea4-v00", "adhoc"],
+        ],
+        "oneModelFlat": ["qwen-cap-e5dea4-v00", "adhoc"],
+        "oneModelGroups": [],
+        "forcedFlat": 4,
+        "byRun": [
+            ["adhoc"],
+            ["gemma4-pilot-1-c4-ab12cd", "gemma4-pilot-1-c16-ab12cd"],
+            ["qwen-cap-e5dea4-v00"],
+        ],
+        "bySweep": [["qwen-cap-e5dea4-v00"], ["gemma4-pilot-1-c4-ab12cd", "gemma4-pilot-1-c16-ab12cd", "adhoc"]],
+        "bogus": 2,
+    }
+
+
+def test_jobs_page_wires_facet_group_and_view_controls_to_url_keys() -> None:
+    source = JOBS_PAGE_PATH.read_text(encoding="utf-8")
+    facets = FACET_FILTERS_PATH.read_text(encoding="utf-8")
+
+    for key in ("run", "scenario", "lifecycle", "deploy"):
+        assert f"const {key}Filter = q.{key} ?? '';" in source
+    assert "const JOB_FACETS = ['run', 'scenario', 'lifecycle', 'deploy'];" in source
+    assert "parseGroupKey(q.group, filtered)" in source
+    assert "onChange=${value => setQuery({ group: value })}" in source
+    assert 'testid="jobs-group-select"' in source
+    assert "keys=${GROUP_KEYS}" in source
+    assert "groupKey === 'none' && html`<${JobTable}" in source
+    assert "foldSweeps=${groupKey !== 'sweep'}" in source
+    assert "storageKey: 'jobs.' + groupKey" in source
+    assert '<${SavedViewsMenu} page="jobs" />' in source
+    # Facet chips/selects share one component and expose stable test ids.
+    assert "data-testid=${d.key + '-filter-chip'}" in facets
+    assert "data-testid=${testidPrefix + f.key + '-filter-select'}" in facets
+    assert "onkeydown=${(e) => { if (e.key === 'Enter' || e.key === ' ')" in facets
+    # "Clear" drops the facet keys too, via a history replace so Back stays one step.
+    clear_body = source[source.index("function clearFilters") : source.index("function chipKeyHandler")]
+    assert "...FACET_CLEAR" in clear_body
+    assert "replaceRoute(hashUrl(route.value" in clear_body

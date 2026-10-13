@@ -5,9 +5,13 @@ import { html } from 'htm/preact';
 import { useState, useEffect, useMemo } from 'preact/hooks';
 import { api, poll } from '../lib/api.js';
 import { jobs, dedupeByNsName, freshness } from '../lib/state.js';
-import { buildJobPath, navigate, query, setQuery } from '../lib/router.js';
+import { buildJobPath, navigate, query, setQuery, replaceRoute, hashUrl, route } from '../lib/router.js';
 import { palette } from '../lib/theme.js';
+import { GROUP_KEYS, applyFacetFilters, deriveRun, deriveScenario, sweepOf, groupItems, parseGroupKey } from '../lib/grouping.js';
 import { JobTable } from '../components/job-table.js';
+import { GroupedList, JobGroupBody, useCollapsedGroups } from '../components/grouped-list.js';
+import { FacetSelects, FacetChips, GroupBySelect } from '../components/facet-filters.js';
+import { SavedViewsMenu } from '../components/saved-views-menu.js';
 import { FreshnessPill, StaleBanner } from '../components/freshness.js';
 import { LoadingPanel } from '../components/spinner.js';
 
@@ -21,6 +25,10 @@ const FILTERS = [
 const PHASE_BY_KEY = Object.fromEntries(
   FILTERS.filter(f => f.value).map(f => [f.label.toLowerCase(), f.value])
 );
+
+// Facets offered as selects/chips on this page; each is also a URL key.
+const JOB_FACETS = ['run', 'scenario', 'lifecycle', 'deploy'];
+const FACET_CLEAR = { run: undefined, scenario: undefined, lifecycle: undefined, deploy: undefined };
 
 function parseSort(s) {
   if (!s) return { key: 'age', dir: -1 };
@@ -44,6 +52,14 @@ function formatSort(sort) {
   return `${sort.key}:${sort.dir === 1 ? 'asc' : 'desc'}`;
 }
 
+// Search covers the visible name/namespace plus what the name encodes: the
+// run, the scenario label and the parent sweep, so "pilot" finds every point
+// of a pilot run without knowing the sweep hash.
+function matchesSearch(job, qLower) {
+  const fields = [job.name, job.namespace, deriveRun(job), deriveScenario(job), sweepOf(job)];
+  return fields.some(f => f != null && String(f).toLowerCase().includes(qLower));
+}
+
 export function Jobs() {
   const [localJobs, setLocalJobs] = useState(jobs.value);
   // ``jobs`` is a global signal — when the user navigates here from
@@ -65,6 +81,10 @@ export function Jobs() {
   const ns = q.ns ?? '';
   const modelFilter = q.model ?? '';
   const endpointFilter = q.endpoint ?? '';
+  const runFilter = q.run ?? '';
+  const scenarioFilter = q.scenario ?? '';
+  const lifecycleFilter = q.lifecycle ?? '';
+  const deployFilter = q.deploy ?? '';
   const sort = parseSort(q.sort);
 
   // Search text is local; debounced into ?q= so typing doesn't spam history
@@ -137,10 +157,7 @@ export function Jobs() {
     }
     if (searchText) {
       const qLower = searchText.toLowerCase();
-      result = result.filter(j =>
-        (j.name ?? '').toLowerCase().includes(qLower) ||
-        (j.namespace ?? '').toLowerCase().includes(qLower),
-      );
+      result = result.filter(j => matchesSearch(j, qLower));
     }
     if (modelFilter) {
       result = result.filter(j => j.model === modelFilter);
@@ -148,8 +165,20 @@ export function Jobs() {
     if (endpointFilter) {
       result = result.filter(j => j.endpoint === endpointFilter);
     }
-    return result;
-  }, [localJobs, activeFilter, ns, searchText, modelFilter, endpointFilter]);
+    return applyFacetFilters(result, {
+      run: runFilter, scenario: scenarioFilter, lifecycle: lifecycleFilter, deploy: deployFilter,
+    });
+  }, [localJobs, activeFilter, ns, searchText, modelFilter, endpointFilter,
+      runFilter, scenarioFilter, lifecycleFilter, deployFilter]);
+
+  // ``?group=`` wins; otherwise group by model as soon as the filtered list
+  // spans more than one model, else the flat legacy table.
+  const groupKey = parseGroupKey(q.group, filtered);
+  const groups = useMemo(
+    () => (groupKey === 'none' ? [] : groupItems(filtered, groupKey)),
+    [filtered, groupKey],
+  );
+  const [isGroupCollapsed, toggleGroup] = useCollapsedGroups('jobs.' + groupKey);
 
   function handleRowClick(job) {
     navigate(buildJobPath(job));
@@ -157,8 +186,12 @@ export function Jobs() {
 
   function clearFilters() {
     setSearchText('');
-    // Intentionally does NOT clear ?sort= — sort is a view preference, not a
-    // filter, and resetting it on "Clear filters" was reported as surprising.
+    // Facet keys are dropped with a history *replace* first so "Clear" stays
+    // a single Back step; the push below carries the rest.
+    replaceRoute(hashUrl(route.value, { ...query.value, ...FACET_CLEAR }).slice(1));
+    // Intentionally does NOT clear ?sort= or ?group= — they are view
+    // preferences, not filters, and resetting them on "Clear filters" was
+    // reported as surprising.
     setQuery({ q: undefined, ns: undefined, phase: undefined, model: undefined, endpoint: undefined });
   }
 
@@ -172,7 +205,11 @@ export function Jobs() {
     };
   }
 
-  const hasFilters = searchText || ns || modelFilter || endpointFilter || activeFilter;
+  const facetFilters = { run: runFilter, scenario: scenarioFilter, lifecycle: lifecycleFilter, deploy: deployFilter };
+  const hasFacetFilters = runFilter || scenarioFilter || lifecycleFilter || deployFilter;
+  const hasFilters = searchText || ns || modelFilter || endpointFilter || activeFilter || hasFacetFilters;
+  const onSortChange = next => setQuery({ sort: formatSort(next) });
+  const onNamespaceClick = nsClicked => setQuery({ ns: nsClicked, q: undefined });
 
   return html`
     <div class="jobs-page" data-testid="page-jobs">
@@ -222,8 +259,8 @@ export function Jobs() {
         <div class="jobs-search-field">
           <input
             type="text"
-            placeholder="Search name..."
-            aria-label="Search jobs by name or namespace"
+            placeholder="Search name, run, scenario, sweep..."
+            aria-label="Search jobs by name, namespace, run, scenario or sweep"
             value=${searchText}
             oninput=${e => setSearchText(e.target.value)}
             onkeydown=${e => { if (e.key === 'Enter' && searchText !== urlQ) { e.preventDefault(); setQuery({ q: searchText }); } }}
@@ -290,6 +327,7 @@ export function Jobs() {
         ${models.length > 1 && html`
           <select
             class="ui-select"
+            aria-label="Filter by model"
             value=${modelFilter}
             onchange=${e => setQuery({ model: e.target.value })}
           >
@@ -300,6 +338,7 @@ export function Jobs() {
         ${endpoints.length > 1 && html`
           <select
             class="ui-select"
+            aria-label="Filter by endpoint"
             value=${endpointFilter}
             onchange=${e => setQuery({ endpoint: e.target.value })}
           >
@@ -315,6 +354,30 @@ export function Jobs() {
             Clear
           </button>
         `}
+      </div>
+
+      <!-- Facets, grouping and saved views -->
+      <div class="list-facet-bar" data-testid="jobs-facet-bar">
+        <${FacetChips}
+          facets=${JOB_FACETS}
+          filters=${facetFilters}
+          onClear=${key => setQuery({ [key]: undefined })}
+        />
+        <${FacetSelects}
+          items=${localJobs}
+          facets=${JOB_FACETS}
+          filters=${facetFilters}
+          onChange=${(key, value) => setQuery({ [key]: value })}
+          testidPrefix="jobs-"
+        />
+        <span class="list-facet-bar__spacer" aria-hidden="true"></span>
+        <${GroupBySelect}
+          value=${groupKey}
+          keys=${GROUP_KEYS}
+          onChange=${value => setQuery({ group: value })}
+          testid="jobs-group-select"
+        />
+        <${SavedViewsMenu} page="jobs" />
       </div>
 
       ${firstLoad && html`
@@ -350,13 +413,31 @@ export function Jobs() {
         </div>
       `}
 
-      ${!firstLoad && filtered.length > 0 && html`<${JobTable}
+      ${!firstLoad && filtered.length > 0 && groupKey === 'none' && html`<${JobTable}
         jobs=${filtered}
         onRowClick=${handleRowClick}
         sort=${sort}
-        onSortChange=${next => setQuery({ sort: formatSort(next) })}
-        onNamespaceClick=${nsClicked => setQuery({ ns: nsClicked, q: undefined })}
+        onSortChange=${onSortChange}
+        onNamespaceClick=${onNamespaceClick}
       />`}
+
+      ${!firstLoad && filtered.length > 0 && groupKey !== 'none' && GroupedList({
+        groups,
+        facet: groupKey,
+        storageKey: 'jobs.' + groupKey,
+        itemNoun: 'job',
+        testidPrefix: 'jobs-group',
+        isCollapsed: isGroupCollapsed,
+        onToggle: toggleGroup,
+        renderGroup: g => html`<${JobGroupBody}
+          items=${g.items}
+          foldSweeps=${groupKey !== 'sweep'}
+          sort=${sort}
+          onSortChange=${onSortChange}
+          onRowClick=${handleRowClick}
+          onNamespaceClick=${onNamespaceClick}
+        />`,
+      })}
     </div>
   `;
 }
