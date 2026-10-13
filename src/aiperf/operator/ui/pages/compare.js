@@ -10,6 +10,7 @@ import { ChartWrapper } from '../components/chart-wrapper.js';
 import { LoadingPanel, Spinner } from '../components/spinner.js';
 import { fmtMilliseconds, fmtNumber, fmtReqPerSecond } from '../lib/format.js';
 import { CHART_TYPOGRAPHY } from '../lib/typography.js';
+import { deltaPct, deltaClass, deltaColor, fmtDeltaPct, betterDirection, oldestKey } from '../lib/delta.js';
 import { applyJobFilters, extractFacets, extractCrossFacets, FILTER_NONE } from './compare-filters.js';
 export { applyJobFilters, extractFacets, extractCrossFacets, FILTER_NONE };
 
@@ -550,6 +551,13 @@ export function Compare() {
   const [comparing, setComparing] = useState(false);
   const [compareError, setCompareError] = useState(null);
 
+  // "Δ% vs baseline" column of the metrics table. ``baselineKey`` is the
+  // user's explicit pick (null = automatic: the oldest selected run, by the
+  // run epoch the backend puts in ``meta``). ``?delta=0`` hides the column
+  // so the plain table can be deep-linked like the other toggles.
+  const [baselineKey, setBaselineKey] = useState(null);
+  const showDelta = query.value.delta !== '0';
+
   // Chip-strip overflow collapse: above 6 selections we hide the tail behind
   // a "+N more" pill so the strip doesn't wrap into a wall of chips.
   const [chipsExpanded, setChipsExpanded] = useState(false);
@@ -805,6 +813,12 @@ export function Compare() {
   const tableClusterByKey = Object.fromEntries(
     displayKeys.map((key) => [key, clusterKeyOf(splitKey(key).ns, meta[key]?.model)]),
   );
+  // Baseline of the Δ% column: the explicit pick while it is still selected,
+  // otherwise the oldest run (smallest run epoch; selection order breaks ties
+  // and is the fallback when the backend sent no epochs). Needs 2+ runs.
+  const baseline = displayKeys.length >= 2
+    ? ((baselineKey && displayKeys.includes(baselineKey)) ? baselineKey : oldestKey(displayKeys, meta))
+    : null;
   const paretoAxes = {
     x: {
       metric: 'output_token_throughput_per_user',
@@ -1273,7 +1287,35 @@ export function Compare() {
           ${compareData && !comparing && entries.length > 0 && html`
             <!-- Metrics table -->
             <div class="card" style="margin-bottom: var(--space-4)">
-              <div class="card-title">Metric Comparison</div>
+              <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2)">
+                <div class="card-title" style="margin-bottom: 0">Metric Comparison</div>
+                ${baseline && html`
+                  <div style="display: flex; align-items: center; gap: var(--space-3); font-size: var(--font-size-xs); color: var(--subtext0)">
+                    <label style="display: inline-flex; align-items: center; gap: var(--space-1); cursor: pointer">
+                      <input
+                        type="checkbox"
+                        checked=${showDelta}
+                        onchange=${(e) => setQuery({ delta: e.target.checked ? '' : '0' })}
+                        data-testid="compare-delta-toggle"
+                        style="accent-color: var(--accent)"
+                      />
+                      Δ% vs baseline
+                    </label>
+                    <label style="display: inline-flex; align-items: center; gap: var(--space-1)">
+                      Baseline
+                      <select
+                        value=${baseline}
+                        onchange=${(e) => setBaselineKey(e.target.value)}
+                        data-testid="compare-baseline-select"
+                        title="Run the other columns are compared against (default: the oldest selected run)"
+                        style="font-family: var(--font-mono); font-size: var(--font-size-xs); background: var(--surface0); color: var(--text); border: 1px solid var(--surface1); border-radius: var(--radius-sm); padding: 2px var(--space-1)"
+                      >
+                        ${displayKeys.map((key) => html`<option key=${key} value=${key}>${splitKey(key).jobId}</option>`)}
+                      </select>
+                    </label>
+                  </div>
+                `}
+              </div>
               ${new Set(Object.values(tableClusterByKey)).size > 1 && html`
                 <div class="text-dim" style="font-size: var(--font-size-xs); margin-bottom: var(--space-2)" data-testid="compare-table-scope-note">
                   ${tableScopeNote(tableClusterByKey)}
@@ -1294,6 +1336,9 @@ export function Compare() {
                           <div style="font-weight: normal; font-size: var(--font-size-xs); color: var(--overlay0)">
                             ${splitKey(key).ns || 'unknown'} · ${shortModel(meta[key]?.model)}
                           </div>
+                          ${key === baseline && html`
+                            <div data-testid="compare-baseline-mark" style="font-weight: normal; font-size: var(--font-size-xs); color: var(--subtext1)">★ baseline</div>
+                          `}
                         </th>
                       `)}
                     </tr>
@@ -1313,6 +1358,16 @@ export function Compare() {
                             const val = entry.values?.[key] ?? null;
                             const isBest = val != null
                               && val === bestByCluster.get(tableClusterByKey[key]);
+                            // Δ% against the baseline run. The number is a
+                            // fact; the colour is a "got better/worse" claim,
+                            // so it is withheld (neutral) when the two runs
+                            // are not comparable (different namespace·model).
+                            const withDelta = showDelta && baseline && key !== baseline;
+                            const pct = withDelta ? deltaPct(entry.values?.[baseline], val) : null;
+                            const sameCluster = tableClusterByKey[key] === tableClusterByKey[baseline];
+                            const klass = withDelta && sameCluster
+                              ? deltaClass(pct, betterDirection(entry.metric, LOWER_IS_BETTER))
+                              : 'neutral';
                             return html`
                               <td
                                 key=${key}
@@ -1320,6 +1375,18 @@ export function Compare() {
                                   + (isBest ? ' color: ' + palette.green : ' color: var(--text)')}
                               >
                                 ${formatNum(val, entry.unit)}
+                                ${withDelta && html`
+                                  <div
+                                    data-testid="compare-delta-cell"
+                                    data-delta-class=${klass}
+                                    title=${sameCluster
+                                      ? 'Change vs baseline ' + splitKey(baseline).jobId
+                                      : 'Change vs baseline ' + splitKey(baseline).jobId + ' (different namespace · model: not colour-coded)'}
+                                    style=${'font-size: var(--font-size-xs); font-weight: 600; font-variant-numeric: tabular-nums; color: ' + deltaColor(klass, palette)}
+                                  >
+                                    ${fmtDeltaPct(pct, fmtNumber)}
+                                  </div>
+                                `}
                               </td>
                             `;
                           })}

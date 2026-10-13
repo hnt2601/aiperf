@@ -16,7 +16,8 @@
  *
  * Renders a nine-row table. The Delta column carries a sign-aware colour cue -
  * green when the change direction matches the "better" direction for that
- * metric, red when worse, gray when the absolute delta is under 1 percent. When
+ * metric, red when worse, gray when the absolute delta is under 1 percent
+ * (helpers shared with ``pages/compare.js`` via ``lib/delta.js``). When
  * one run lacks a summary (legacy flat layout), that column surfaces ``n/a``
  * rather than failing the whole view.
  *
@@ -43,6 +44,7 @@ import { api } from '../lib/api.js';
 import { navigate } from '../lib/router.js';
 import { palette } from '../lib/theme.js';
 import { fmtNumber } from '../lib/format.js';
+import { deltaPct, deltaClass, deltaColor, fmtDeltaPct } from '../lib/delta.js';
 
 /** The nine metrics to diff. ``path`` is dotted-lookup into the summary JSON;
  *  ``better`` is the direction that scores green in the Delta column. */
@@ -145,42 +147,21 @@ function fmtEpoch(epoch) {
        + `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
 }
 
-/** Classify a percentage delta into one of three buckets. ``null`` for the
- *  input (one side missing) yields ``'neutral'`` so the gray color lands. */
-function deltaClass(pct, better) {
-  if (pct == null || !isFinite(pct)) return 'neutral';
-  if (Math.abs(pct) < 1) return 'neutral';
-  const improved = better === 'higher' ? pct > 0 : pct < 0;
-  return improved ? 'better' : 'worse';
-}
-
-function deltaColor(klass) {
-  if (klass === 'better') return palette.green;
-  if (klass === 'worse') return palette.red;
-  return palette.overlay0;
-}
-
 const TD_BASE = 'padding: var(--space-2) var(--space-3); border-bottom: 1px solid ' + palette.surface0;
 const TH_BASE = 'padding: var(--space-2) var(--space-3); text-align: left; font-weight: 700; color: ' + palette.text + '; background: ' + palette.surface0 + '; border-bottom: 2px solid ' + palette.surface1 + '; white-space: nowrap';
 
 function Row({ metric, a, b, comparable }) {
   const va = dig(a, metric.path);
   const vb = dig(b, metric.path);
-  const pct = (va != null && vb != null && va !== 0)
-    ? ((vb - va) / va) * 100
-    : null;
+  const pct = deltaPct(va, vb);
   // The number is a fact; the green/red is an interpretation ("this run got
   // better"). That interpretation only holds if both runs asked the server to
   // do the same work, so when the two epochs used different load parameters
   // the delta stays but its colour does not.
   const klass = comparable === false ? 'neutral' : deltaClass(pct, metric.better);
-  const color = deltaColor(klass);
+  const color = deltaColor(klass, palette);
   const fmtVal = v => (v == null ? 'n/a' : `${fmtNumber(v, metric.digits)} ${metric.unit}`);
-  const fmtDelta = () => {
-    if (pct == null) return '—';
-    const sign = pct > 0 ? '+' : '';
-    return `${sign}${fmtNumber(pct, 1)}%`;
-  };
+  const fmtDelta = () => fmtDeltaPct(pct, fmtNumber);
   return html`
     <tr data-testid=${`cmp-row-${metric.path}`}>
       <td style=${TD_BASE + '; color: ' + palette.text + '; font-weight: 600'}>${metric.label}</td>

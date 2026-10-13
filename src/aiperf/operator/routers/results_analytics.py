@@ -58,11 +58,15 @@ def _pivot_compare_rows(
 
     Input:  [{job_id, request_throughput_avg, request_throughput_unit, ...}, ...]
     Output: ([{metric, stat, unit, values: {job_id: value}}, ...],
-             {<ns>/<job_id>: {gpu_count, gpu_name, model, endpoint}})
+             {<ns>/<job_id>: {gpu_count, gpu_name, model, endpoint, epoch, start_time}})
 
     The ``meta`` map carries per-job context — GPU count and accelerator
     model — so the UI can normalize throughput to per-GPU values and color
-    runs by hardware (the InferenceX-style correlation).
+    runs by hardware (the InferenceX-style correlation). ``epoch`` (the run's
+    epoch directory name, a microsecond timestamp) and ``start_time`` let the
+    UI order runs by age, e.g. to pick the oldest run as the baseline of the
+    "delta vs baseline" column; they are passed through as stored, ``None``
+    when the summary did not carry them.
     """
     qualified_jobs = {job for job in requested_jobs if "/" in job}
     bare_jobs = {job for job in requested_jobs if "/" not in job}
@@ -107,6 +111,8 @@ def _pivot_compare_rows(
             "gpu_name": row.get("gpu_name"),
             "model": row.get("model"),
             "endpoint": _redact_endpoint(row.get("endpoint")),
+            "epoch": row.get("epoch"),
+            "start_time": row.get("start_time"),
         }
     return entries, meta
 

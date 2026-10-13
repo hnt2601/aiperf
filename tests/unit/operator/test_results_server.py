@@ -25,9 +25,6 @@ import httpx
 import orjson
 import pytest
 import zstandard
-from fastapi.testclient import TestClient
-from pytest import param
-
 from aiperf.common.results_markers import write_ready_marker
 from aiperf.operator import runs_index
 from aiperf.operator import runs_index as runs_index_mod
@@ -724,6 +721,47 @@ class TestCompareEndpoint:
         data = resp.json()
         assert "job-1" in data["job_ids"]
         assert "job-2" in data["job_ids"]
+
+    @pytest.mark.asyncio
+    async def test_compare_meta_carries_run_epoch_and_start_time(
+        self, results_dir: Path, client: httpx.AsyncClient
+    ) -> None:
+        """``meta`` exposes the run epoch (and ``start_time`` when the summary
+        has one) so the UI can order runs by age for its baseline pick."""
+        _create_result_file(
+            results_dir,
+            "ns",
+            "job-1",
+            "profile_export_aiperf.json",
+            _summary_json(metric_val=100.0),
+        )
+        _create_result_file(
+            results_dir,
+            "ns",
+            "job-2",
+            "profile_export_aiperf.json",
+            _summary_json(metric_val=200.0),
+        )
+        await _ingest_runs(results_dir)
+
+        resp = await client.get(
+            "/api/v1/analytics/compare",
+            params={"jobs": ["job-1", "job-2"]},
+        )
+
+        assert resp.status_code == 200
+        meta = resp.json()["meta"]
+        assert meta.keys() == {"job-1", "job-2"}
+        for entry in meta.values():
+            assert {
+                "gpu_count",
+                "gpu_name",
+                "model",
+                "endpoint",
+                "epoch",
+                "start_time",
+            } <= entry.keys()
+            assert isinstance(entry["epoch"], str) and entry["epoch"].isdigit()
 
     @pytest.mark.asyncio
     async def test_compare_unambiguous_bare_jobs_preserves_bare_keys(
