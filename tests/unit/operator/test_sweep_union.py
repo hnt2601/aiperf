@@ -34,9 +34,15 @@ def _live_cr(
     failed: int = 0,
     model: str = "m",
     creation: str = "2026-04-01T00:00:00Z",
+    labels: dict | None = None,
 ) -> dict:
     return {
-        "metadata": {"namespace": ns, "name": name, "creationTimestamp": creation},
+        "metadata": {
+            "namespace": ns,
+            "name": name,
+            "creationTimestamp": creation,
+            **({"labels": labels} if labels is not None else {}),
+        },
         "spec": {
             "template": {"spec": {"models": [{"name": model}]}},
             "sweep": {
@@ -70,6 +76,47 @@ async def test_list_all_sweeps_live_only(tmp_path: Path) -> None:
     assert r.phase == "Running"
     assert r.total_variations == 4
     assert r.aggregate_path is None
+    assert r.labels == {}
+
+
+@pytest.mark.asyncio
+async def test_list_all_sweeps_live_record_carries_cr_labels(tmp_path: Path) -> None:
+    """``metadata.labels`` ride on the record unfiltered; non-strings dropped."""
+    from aiperf.operator import sweep_union
+
+    labels = {"aiperf.nvidia.com/run": "r1", "team": "perf", "bad": 3}
+    with patch.object(
+        sweep_union,
+        "list_aiperfsweeps",
+        AsyncMock(return_value=[_live_cr("bench", "s1", labels=labels)]),
+    ):
+        records = await sweep_union.list_all_sweeps(
+            MagicMock(), tmp_path, all_namespaces=True
+        )
+    assert records[0].labels == {"aiperf.nvidia.com/run": "r1", "team": "perf"}
+
+
+@pytest.mark.asyncio
+async def test_list_all_sweeps_both_takes_live_labels(tmp_path: Path) -> None:
+    from aiperf.operator import sweep_union
+
+    _write_aggregate(
+        tmp_path,
+        "bench",
+        "s1",
+        {"phase": "Succeeded", "totalVariations": 4, "completedRuns": 4},
+    )
+    labels = {"aiperf.nvidia.com/run": "r1"}
+    with patch.object(
+        sweep_union,
+        "list_aiperfsweeps",
+        AsyncMock(return_value=[_live_cr("bench", "s1", labels=labels)]),
+    ):
+        records = await sweep_union.list_all_sweeps(
+            MagicMock(), tmp_path, all_namespaces=True
+        )
+    assert records[0].source == "both"
+    assert records[0].labels == labels
 
 
 @pytest.mark.asyncio

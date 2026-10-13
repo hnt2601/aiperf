@@ -435,6 +435,64 @@ def test_list_jobs_includes_archived_only_entry(tmp_path: Path, monkeypatch):
     names = {j["name"]: j for j in body["jobs"]}
     assert "archive-only" in names
     assert names["archive-only"]["source"] == "archived"
+    assert names["archive-only"]["labels"] == {}
+
+
+def test_jobs_api_serves_allow_listed_labels(tmp_path: Path, monkeypatch):
+    """``labels`` on list items and archived ``job`` detail, narrowed to the UI prefixes.
+
+    Live detail needs the pod roster from a real API client; its label
+    projection is covered by ``find_any_job`` in ``test_job_union_labels``.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from aiperf.kubernetes.models import AIPerfJobInfo
+    from aiperf.operator import job_union as ju
+    from aiperf.operator.environment import OperatorEnvironment
+    from aiperf.operator.routers.jobs import create_jobs_router
+
+    monkeypatch.setattr(OperatorEnvironment.UI, "LABEL_PREFIXES", "aiperf.nvidia.com/")
+    ju._pvc_scan_cache.entries.clear()
+    raw = {"aiperf.nvidia.com/run": "nightly-1", "app.kubernetes.io/name": "aiperf"}
+
+    d = tmp_path / "ns" / "archived" / _TEST_EPOCH
+    d.mkdir(parents=True)
+    (d / "profile_export_aiperf.json").write_bytes(
+        orjson.dumps({"status": "Succeeded"})
+    )
+    (d / "job_labels.json").write_bytes(orjson.dumps(raw))
+    write_latest(tmp_path, "ns", "archived", _TEST_EPOCH)
+
+    async def fake_list(api, *, all_namespaces=True, namespace=None, **_):
+        return [
+            AIPerfJobInfo(
+                name="live", namespace="ns", phase="Running", job_id="live", labels=raw
+            )
+        ]
+
+    async def fake_find(api, name, namespace):
+        return None
+
+    monkeypatch.setattr(ju, "list_aiperf_jobs", fake_list)
+    monkeypatch.setattr(ju, "find_aiperf_job", fake_find)
+
+    app = FastAPI()
+    app.include_router(create_jobs_router([object()], tmp_path))
+    with TestClient(app) as client:
+        listing = client.get("/api/v1/jobs")
+        archived_detail = client.get("/api/v1/jobs/ns/archived")
+
+    assert listing.status_code == 200, listing.text
+    by_name = {j["name"]: j["labels"] for j in listing.json()["jobs"]}
+    assert by_name == {
+        "live": {"aiperf.nvidia.com/run": "nightly-1"},
+        "archived": {"aiperf.nvidia.com/run": "nightly-1"},
+    }
+    assert archived_detail.status_code == 200, archived_detail.text
+    assert archived_detail.json()["job"]["labels"] == {
+        "aiperf.nvidia.com/run": "nightly-1"
+    }
 
 
 def _v1_event(

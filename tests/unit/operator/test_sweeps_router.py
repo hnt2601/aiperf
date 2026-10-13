@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -34,7 +35,9 @@ def _seed_sweep_epoch(base_dir: Path, namespace: str, name: str, epoch: str) -> 
     return sweep_dir
 
 
-def _live_record(name: str = "s1") -> SweepRecord:
+def _live_record(
+    name: str = "s1", *, labels: dict[str, str] | None = None
+) -> SweepRecord:
     return SweepRecord(
         namespace="bench",
         name=name,
@@ -45,6 +48,7 @@ def _live_record(name: str = "s1") -> SweepRecord:
         failed_runs=0,
         age_seconds=10,
         model="m",
+        labels=dict(labels or {}),
         raw_spec={
             "benchmark": {
                 "models": {"items": [{"name": "m"}]},
@@ -92,6 +96,42 @@ def test_list_returns_records(tmp_path: Path) -> None:
     assert len(body["sweeps"]) == 1
     assert body["sweeps"][0]["name"] == "s1"
     assert body["sweeps"][0]["source"] == "live"
+    assert body["sweeps"][0]["labels"] == {}
+
+
+def test_list_serves_allow_listed_labels_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``SweepSummary.labels`` is the CR's labels narrowed to the UI prefixes."""
+    from aiperf.operator.environment import OperatorEnvironment
+
+    monkeypatch.setattr(OperatorEnvironment.UI, "LABEL_PREFIXES", "aiperf.nvidia.com/")
+    rec = _live_record(
+        labels={
+            "aiperf.nvidia.com/run": "nightly-1",
+            "aiperf.nvidia.com/scenario": "agentx",
+            "perfledger.io/lifecycle": "candidate",
+            "app.kubernetes.io/name": "aiperf",
+        }
+    )
+    with patch(
+        "aiperf.operator.routers.sweeps.list_all_sweeps",
+        AsyncMock(return_value=[rec]),
+    ):
+        r = _client_with(MagicMock(), tmp_path).get("/api/v1/sweeps")
+    assert r.status_code == 200
+    assert r.json()["sweeps"][0]["labels"] == {
+        "aiperf.nvidia.com/run": "nightly-1",
+        "aiperf.nvidia.com/scenario": "agentx",
+    }
+
+    monkeypatch.setattr(OperatorEnvironment.UI, "LABEL_PREFIXES", "perfledger.io/")
+    with patch(
+        "aiperf.operator.routers.sweeps.list_all_sweeps",
+        AsyncMock(return_value=[rec]),
+    ):
+        r = _client_with(MagicMock(), tmp_path).get("/api/v1/sweeps")
+    assert r.json()["sweeps"][0]["labels"] == {"perfledger.io/lifecycle": "candidate"}
 
 
 def test_detail_404_when_missing(tmp_path: Path) -> None:

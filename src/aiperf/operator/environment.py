@@ -28,6 +28,7 @@ from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aiperf.kubernetes.constants import DEFAULT_OPERATOR_NAMESPACE
+from aiperf.operator.labels import parse_label_prefixes
 
 __all__ = [
     "OperatorEnvironment",
@@ -527,6 +528,31 @@ class _DashboardSettings(BaseSettings):
     )
 
 
+class _OperatorUISettings(BaseSettings):
+    """Dashboard (results-server ``/api/v1/*``) presentation settings."""
+
+    model_config = SettingsConfigDict(env_prefix="AIPERF_OPERATOR_UI_")
+
+    # Keep in sync with ``aiperf.operator.labels.DEFAULT_UI_LABEL_PREFIXES``
+    # (pinned by tests); a literal keeps the generated env-var docs readable.
+    LABEL_PREFIXES: str = Field(
+        default="aiperf.nvidia.com/",
+        description="Comma-separated allow-list of Kubernetes label key prefixes "
+        "served as ``labels`` on ``GET /api/v1/jobs`` and ``GET /api/v1/sweeps`` "
+        "items so the dashboard can group runs by label (run, scenario, "
+        "lifecycle, ...). A label is kept iff its key starts with one of the "
+        "prefixes; everything else on the CR is dropped from the API payload. "
+        "Set via AIPERF_OPERATOR_UI_LABEL_PREFIXES on the results-server "
+        "container, e.g. 'aiperf.nvidia.com/,perfledger.io/'. An empty value "
+        "serves no labels.",
+    )
+
+    @property
+    def label_prefixes(self) -> tuple[str, ...]:
+        """``LABEL_PREFIXES`` split into trimmed, non-empty prefixes."""
+        return parse_label_prefixes(self.LABEL_PREFIXES)
+
+
 class _OperatorEnvironment(BaseSettings):
     """Root operator environment configuration.
 
@@ -676,6 +702,10 @@ class _OperatorEnvironment(BaseSettings):
     DASHBOARD: _DashboardSettings = Field(
         default_factory=_DashboardSettings,
         description="Plotly Dashboard sidecar wiring.",
+    )
+    UI: _OperatorUISettings = Field(
+        default_factory=_OperatorUISettings,
+        description="Dashboard API presentation settings (label allow-list).",
     )
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,6 +66,9 @@ class SweepRecord:
     # Per-state run counts rolled up from children (``status.runStates``).
     # Keyed by run-state bucket: pending / running / completed / failed / cancelled.
     run_states: dict[str, int] = field(default_factory=dict)
+    # ``metadata.labels`` of the live AIPerfSweep CR, unfiltered. Archived
+    # ``aggregate.json`` carries no labels, so PVC-only records stay empty.
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 def _now_utc() -> datetime:
@@ -141,6 +145,14 @@ def sanitize_current_child_ref(raw: Any) -> dict[str, Any] | None:
     return raw
 
 
+def _metadata_labels(meta: Mapping[str, Any]) -> dict[str, str]:
+    """Return string-valued ``metadata.labels`` from an untrusted CR dict."""
+    raw = meta.get("labels")
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
 def _record_from_live(cr: dict[str, Any]) -> SweepRecord:
     meta = cr.get("metadata") or {}
     spec = cr.get("spec") or {}
@@ -168,6 +180,7 @@ def _record_from_live(cr: dict[str, Any]) -> SweepRecord:
         api_url=status.get("apiUrl") or None,
         results_available=bool(status.get("resultsAvailable")),
         run_states=run_states,
+        labels=_metadata_labels(meta),
     )
 
 
@@ -322,6 +335,7 @@ def _merge(live: list[SweepRecord], archived: list[SweepRecord]) -> list[SweepRe
             api_url=live_rec.api_url or existing.api_url,
             results_available=live_rec.results_available or existing.results_available,
             run_states=live_rec.run_states,
+            labels=live_rec.labels or existing.labels,
         )
         by_key[key] = merged
     return sorted(by_key.values(), key=lambda r: r.age_seconds)

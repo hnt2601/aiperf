@@ -33,6 +33,8 @@ from aiperf.kubernetes.crd_models import MetricsSummary
 from aiperf.kubernetes.models import AIPerfJobInfo
 from aiperf.operator import runs_index
 from aiperf.operator.artifact_names import find_summary_path
+from aiperf.operator.environment import OperatorEnvironment
+from aiperf.operator.labels import filter_labels, read_job_labels
 from aiperf.operator.results_layout import resolve_run_dir
 from aiperf.operator.runs_index import zstd_decompress
 
@@ -159,6 +161,18 @@ def _variation_values_from_children_manifest(
     return None
 
 
+def _ui_labels(labels: dict[str, str] | None) -> dict[str, str]:
+    """Narrow CR labels to the dashboard allow-list (AIPERF_OPERATOR_UI_LABEL_PREFIXES)."""
+    return filter_labels(labels, OperatorEnvironment.UI.label_prefixes)
+
+
+def _archived_labels(run_dir: Path | None) -> dict[str, str]:
+    """Allow-listed labels from the run dir's ``job_labels.json``, or ``{}``."""
+    if run_dir is None:
+        return {}
+    return _ui_labels(read_job_labels(run_dir))
+
+
 def _sweep_linkage_from_marker(
     job_dir: Path,
 ) -> tuple[str | None, int | None, str | None]:
@@ -231,6 +245,7 @@ def archived_stub(
         sweep_name=sweep_name,
         variation_index=variation_index,
         variation_label=variation_label,
+        labels=_archived_labels(run_dir),
     )
 
 
@@ -296,6 +311,7 @@ def _archived_from_summary(
     mtime_iso: str,
     name_dir: Path | None = None,
     base_dir: Path | None = None,
+    run_dir: Path | None = None,
 ) -> AIPerfJobInfo:
     """Build an archived ``AIPerfJobInfo`` from a summary JSON dict.
 
@@ -303,7 +319,9 @@ def _archived_from_summary(
     directory to populate sweep linkage for archived sweep children whose
     parent CR has been TTL-reaped. ``base_dir`` additionally enables the
     swept-values lookup in the parent sweep epoch's ``children.json``; without
-    it the entry still carries linkage, just no values.
+    it the entry still carries linkage, just no values. ``run_dir`` (the
+    epoch directory) enables the ``job_labels.json`` read that populates
+    ``labels``; without it the entry carries no labels.
     """
     phase = _ARCHIVED_PHASE_PLACEHOLDER
     start_time = _utc_iso(summary.get("start_time"))
@@ -361,6 +379,7 @@ def _archived_from_summary(
         variation_label=linkage.variation_label,
         variation_values=variation_values,
         trial_index=linkage.trial_index,
+        labels=_archived_labels(run_dir),
     )
 
 
@@ -446,6 +465,7 @@ def _archived_job_from_dir(
         mtime_iso=_mtime_iso(summary_path),
         name_dir=name_dir,
         base_dir=base_dir,
+        run_dir=run,
     )
 
 
@@ -613,6 +633,8 @@ def _backfill_cr_from_archived(cr: AIPerfJobInfo, pvc: AIPerfJobInfo) -> None:
         cr.variation_values = pvc.variation_values
     if cr.trial_index is None:
         cr.trial_index = pvc.trial_index
+    if not cr.labels:
+        cr.labels = pvc.labels
 
 
 async def list_all_jobs(
@@ -639,9 +661,11 @@ async def list_all_jobs(
         logger.warning(f"list_aiperf_jobs failed, continuing PVC-only: {e}")
         cr_jobs = []
     # Freshly stamped source=live (even though the default is live, make it
-    # explicit so the "both" promotion below is unambiguous).
+    # explicit so the "both" promotion below is unambiguous). ``to_info()``
+    # copies CR labels verbatim; the API only serves the allow-listed ones.
     for j in cr_jobs:
         j.source = "live"
+        j.labels = _ui_labels(j.labels)
 
     # Archived artifacts are immutable after publication. Keep a short-lived,
     # bounded snapshot so dashboard polling does not repeatedly walk a large
@@ -680,6 +704,7 @@ async def _find_live_cr(
         return None
     if cr is not None:
         cr.source = "live"
+        cr.labels = _ui_labels(cr.labels)
     return cr
 
 
@@ -714,6 +739,7 @@ def _find_archived_job(
         mtime_iso=_mtime_iso(summary_path),
         name_dir=run.parent,
         base_dir=results_dir,
+        run_dir=run,
     )
 
 

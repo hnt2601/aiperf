@@ -35,6 +35,7 @@ from aiperf.common.results_markers import EPOCH_RE
 from aiperf.kubernetes.models import AIPerfJobInfo
 from aiperf.operator.environment import OperatorEnvironment
 from aiperf.operator.job_union import list_all_jobs
+from aiperf.operator.labels import filter_labels
 from aiperf.operator.results_layout import (
     list_sweep_epochs_async,
     resolve_sweep_dir,
@@ -103,6 +104,7 @@ def _summary(rec: SweepRecord) -> SweepSummary:
             sanitize_current_child_ref(rec.current_child_ref)
         ),
         run_states=sanitize_run_states(rec.run_states),
+        labels=filter_labels(rec.labels, OperatorEnvironment.UI.label_prefixes),
     )
 
 

@@ -608,6 +608,14 @@ Retry delays for kopf reconciliation categories.
 | `AIPERF_OPERATOR_RECONCILE_CREATE_HARVEST_RETRY_DELAY_SECONDS` | `30.0` | ≥ 0, ≤ 600 | Delay before retrying resource creation or sweep-result harvest. |
 | `AIPERF_OPERATOR_RECONCILE_TTL_DELETE_RETRY_DELAY_SECONDS` | `60.0` | ≥ 0, ≤ 3600 | Delay before retrying an expired AIPerfSweep deletion. |
 
+## OPERATORUI
+
+Dashboard (results-server ``/api/v1/*``) presentation settings.
+
+| Environment Variable | Default | Constraints | Description |
+|----------------------|---------|-------------|-------------|
+| `AIPERF_OPERATOR_UI_LABEL_PREFIXES` | `'aiperf.nvidia.com/'` | — | Comma-separated allow-list of Kubernetes label key prefixes served as ``labels`` on ``GET /api/v1/jobs`` and ``GET /api/v1/sweeps`` items so the dashboard can group runs by label (run, scenario, lifecycle, ...). A label is kept iff its key starts with one of the prefixes; everything else on the CR is dropped from the API payload. Set via AIPERF_OPERATOR_UI_LABEL_PREFIXES on the results-server container, e.g. 'aiperf.nvidia.com/,perfledger.io/'. An empty value serves no labels. |
+
 ## OTEL
 
 OpenTelemetry metrics streaming configuration. Controls buffering and flush behavior for OTLP metric streaming.

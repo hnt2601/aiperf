@@ -437,6 +437,7 @@ class AIPerfJobCR(K8sCamelModel):
             variation_label=variation_label,
             variation_values=_variation_values(self.metadata.annotations),
             trial_index=trial_index,
+            labels=dict(self.metadata.labels),
         )
 
 
@@ -576,6 +577,17 @@ class AIPerfJobInfo(K8sCamelModel):
         description=(
             "Trial index from the aiperf.nvidia.com/trial-index label; only "
             "set on multi-trial sweep children (serializes as trialIndex)."
+        ),
+    )
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Kubernetes labels on the AIPerfJob. ``to_info()`` copies "
+            "``metadata.labels`` verbatim; the operator dashboard API narrows "
+            "them to the AIPERF_OPERATOR_UI_LABEL_PREFIXES allow-list before "
+            "serving (see ``aiperf.operator.labels.filter_labels``). Archived "
+            "runs read them from the persisted ``job_labels.json``. Empty "
+            "when neither source carries any."
         ),
     )
 

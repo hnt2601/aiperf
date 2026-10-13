@@ -578,6 +578,7 @@ class TestSweepsRouterResponseSchema:
             "results_available",
             "current_child_ref",
             "run_states",
+            "labels",
         }
 
     @pytest.mark.asyncio

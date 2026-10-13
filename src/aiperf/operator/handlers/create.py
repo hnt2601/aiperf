@@ -356,7 +356,14 @@ async def _persist_spec_and_index(
     try:
         plain_spec = _to_plain(spec)
         epoch = epoch_key_from_body(body)
-        await save_job_spec_file(namespace, job_id, plain_spec, epoch=epoch)
+        labels = _to_plain((body.get("metadata") or {}).get("labels") or {})
+        await save_job_spec_file(
+            namespace,
+            job_id,
+            plain_spec,
+            epoch=epoch,
+            labels=labels if isinstance(labels, dict) else None,
+        )
         await runs_index.upsert_run_created(namespace, job_id, epoch, spec=plain_spec)
     except (
         # sqlite3.Error covers aiosqlite index writes (e.g. OperationalError

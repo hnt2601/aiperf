@@ -112,6 +112,15 @@ class SweepSummary(BaseModel):
         default=None,
         description="ISO-8601 ``status.completedAt`` stamped by the operator at terminal phase.",
     )
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "AIPerfSweep ``metadata.labels`` narrowed to the "
+            "AIPERF_OPERATOR_UI_LABEL_PREFIXES allow-list, for grouping in the "
+            "dashboard. Empty for archived-only sweeps (``aggregate.json`` "
+            "carries no labels)."
+        ),
+    )
     api_url: str | None = Field(
         default=None,
         description="Operator-side API base URL for cross-process result fetches.",

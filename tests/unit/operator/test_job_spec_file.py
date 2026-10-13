@@ -57,3 +57,34 @@ async def test_save_job_spec_file_redacts_public_endpoint_credentials(
         f"https://{REDACTED_VALUE}@host/v1?token={REDACTED_VALUE}&model=m"
     ]
     assert spec["benchmark"]["endpoint"]["apiKey"] == "public-secret"
+
+
+@pytest.mark.asyncio
+async def test_save_job_spec_file_writes_labels_sidecar(tmp_path: Path) -> None:
+    """CR labels land in ``job_labels.json`` beside the spec, unfiltered."""
+    labels = {"aiperf.nvidia.com/run": "nightly-1", "team": "perf"}
+    with patch("aiperf.operator.job_spec_file.OperatorEnvironment") as env:
+        env.RESULTS.DIR = tmp_path
+        await save_job_spec_file(
+            "ns", "job-1", {"benchmark": {}}, epoch="100", labels=labels
+        )
+
+    run_dir = tmp_path / "ns" / "job-1" / "100"
+    assert orjson.loads((run_dir / "job_spec.json").read_bytes()) == {"benchmark": {}}
+    assert orjson.loads((run_dir / "job_labels.json").read_bytes()) == labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("labels", [None, {}])
+async def test_save_job_spec_file_skips_sidecar_without_labels(
+    tmp_path: Path, labels: dict[str, str] | None
+) -> None:
+    with patch("aiperf.operator.job_spec_file.OperatorEnvironment") as env:
+        env.RESULTS.DIR = tmp_path
+        await save_job_spec_file(
+            "ns", "job-1", {"benchmark": {}}, epoch="100", labels=labels
+        )
+
+    run_dir = tmp_path / "ns" / "job-1" / "100"
+    assert (run_dir / "job_spec.json").exists()
+    assert not (run_dir / "job_labels.json").exists()
