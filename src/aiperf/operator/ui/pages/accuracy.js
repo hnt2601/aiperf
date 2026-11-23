@@ -8,19 +8,28 @@ import { LoadingPanel } from '../components/spinner.js';
 import { ModelPill } from '../components/pills.js';
 import {
   DIRECTION_GLYPH,
-  DIRECTION_LABEL,
   FALLBACK_LABEL,
+  TASK_ROWS_COLLAPSED,
   barPercent,
+  buildCompareQuery,
   buildQuery,
+  compareReasonText,
   describeLoadError,
+  directionText,
   fmtCi,
   fmtCount,
+  fmtDelta,
+  fmtP,
   fmtRate,
   groupByBenchmark,
+  isUngraded,
   judgeText,
   labelsText,
+  readingText,
   rowNotes,
+  runLabel,
   safeHttpUrl,
+  visibleTasks,
 } from './accuracy-helpers.js';
 
 // Read-only JSON served by PerfLedger (perfledger-mcp, route GET /api/accuracy) and mapped under the UI's own prefix by the
@@ -28,15 +37,26 @@ import {
 // Resolved against the page's own location, like lib/base-path.js does on newer builds. Deliberately not imported from there:
 // that module does not exist in 0.13.0 (f3a76e5), and a missing static import would stop the whole SPA from loading.
 const API_URL = new URL('perfledger-api/accuracy', document.baseURI).pathname;
+// Paired comparison of two runs (GET /api/accuracy/compare): same prefix and same gateway as the list route.
+const COMPARE_URL = new URL('perfledger-api/accuracy/compare', document.baseURI).pathname;
 
-async function fetchAccuracy(filters, signal) {
-  const res = await fetch(API_URL + buildQuery(filters), {
+async function getJson(url, signal) {
+  const res = await fetch(url, {
     headers: { Accept: 'application/json' },
     credentials: 'same-origin',
     signal,
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`API ${res.status}: ${text.slice(0, 200)}`);
+  if (!res.ok) {
+    // Structured errors carry a readable message; anything else (e.g. a gateway error page) keeps its raw text.
+    let message = text.slice(0, 200);
+    try {
+      message = JSON.parse(text)?.error?.message ?? message;
+    } catch {
+      /* keep the raw text */
+    }
+    throw new Error(`API ${res.status}: ${message}`);
+  }
   try {
     return JSON.parse(text);
   } catch {
@@ -44,6 +64,9 @@ async function fetchAccuracy(filters, signal) {
     throw new Error(`API ${res.status}: response is not JSON`);
   }
 }
+
+const fetchAccuracy = (filters, signal) => getJson(API_URL + buildQuery(filters), signal);
+const fetchCompare = (candidate, baseline, signal) => getJson(COMPARE_URL + buildCompareQuery(candidate, baseline), signal);
 
 function formatDate(iso) {
   if (!iso) return '—';
@@ -54,6 +77,11 @@ function formatDate(iso) {
 }
 
 export function TaskRows({ row }) {
+  // Benchmarks such as MMLU-Pro have dozens of tasks: collapsed after a dozen, with a toggle.
+  const [expanded, setExpanded] = useState(false);
+  const tasks = row.tasks ?? [];
+  const shown = visibleTasks(tasks, expanded);
+  const ungraded = isUngraded(row);
   return html`
     <div class="job-table-wrapper">
       <table class="job-table accuracy-table" aria-label=${'Per-task results for ' + (row.model ?? 'run')}>
@@ -71,23 +99,23 @@ export function TaskRows({ row }) {
           </tr>
         </thead>
         <tbody>
-          ${row.tasks.map((t) => html`
+          ${shown.map((t) => html`
             <tr class="job-table-row" key=${t.task} data-testid="accuracy-task-row">
               <td class="job-table-td">${t.task}</td>
-              <td class="job-table-td">${t.metric}</td>
+              <td class="job-table-td">${t.metric ?? '—'}</td>
               <td class="job-table-td accuracy-rate">
                 <span class="accuracy-rate__value">${fmtRate(t.rate)}</span>
                 <span class="accuracy-bar" aria-hidden="true">
                   <span
-                    class=${'accuracy-bar__fill accuracy-bar__fill--' + t.direction}
+                    class=${'accuracy-bar__fill accuracy-bar__fill--' + (t.direction ?? 'neutral')}
                     style=${'width:' + barPercent(t.rate) + '%'}
                   ></span>
                 </span>
               </td>
               <td class="job-table-td">${fmtCi(t.ci)}</td>
-              <td class="job-table-td">${fmtCount(t.count, t.total)}</td>
-              <td class="job-table-td" title=${DIRECTION_LABEL[t.direction] ?? t.direction}>
-                <span aria-hidden="true">${DIRECTION_GLYPH[t.direction] ?? '◆'}</span> ${DIRECTION_LABEL[t.direction] ?? t.direction}
+              <td class="job-table-td">${ungraded ? `${t.total ?? '—'} generated` : fmtCount(t.count, t.total)}</td>
+              <td class="job-table-td" title=${directionText(t.direction)}>
+                ${t.direction && html`<span aria-hidden="true">${DIRECTION_GLYPH[t.direction] ?? '◆'}</span> `}${directionText(t.direction)}
               </td>
               <td class="job-table-td">${labelsText(t.labels)}</td>
               <td class="job-table-td">${t.unparsed ?? '—'}</td>
@@ -97,6 +125,123 @@ export function TaskRows({ row }) {
         </tbody>
       </table>
     </div>
+    ${tasks.length > TASK_ROWS_COLLAPSED && html`
+      <button
+        type="button"
+        class="filter-tab accuracy-toggle"
+        data-testid="accuracy-toggle-tasks"
+        onclick=${() => setExpanded((v) => !v)}
+      >
+        ${expanded ? 'Show fewer tasks' : `Show all ${tasks.length} tasks`}
+      </button>
+    `}
+  `;
+}
+
+/** "graded: sandbox" / "not graded" pills; plain inline runs (the normal case) get none. */
+function GradingPill({ row }) {
+  if (isUngraded(row)) {
+    return html`<span class="meta-pill accuracy-pill--warn" title="Generation only; scores come from the sandbox grading step">not graded</span>`;
+  }
+  if (row.grading?.mode === 'sandbox') {
+    return html`<span class="meta-pill" title=${row.grading.graded_from ? 'Graded from generation ' + row.grading.graded_from : 'Graded in the sandbox'}>graded: sandbox</span>`;
+  }
+  return null;
+}
+
+export function CompareTable({ data }) {
+  const rows = [...(data.tasks ?? [])];
+  if (data.overall) rows.push({ task: 'Overall', metric: data.overall.metric ?? '', overall: true, ...data.overall });
+  return html`
+    <div class="job-table-wrapper">
+      <table class="job-table accuracy-table" aria-label="Paired comparison per task">
+        <thead>
+          <tr>
+            <th class="job-table-th" scope="col">Task</th>
+            <th class="job-table-th" scope="col">Metric</th>
+            <th class="job-table-th" scope="col">Baseline</th>
+            <th class="job-table-th" scope="col">Candidate</th>
+            <th class="job-table-th" scope="col">Δ metric</th>
+            <th class="job-table-th" scope="col" title="Problems where only the baseline was good / only the candidate was good">Only base / only cand</th>
+            <th class="job-table-th" scope="col">McNemar</th>
+            <th class="job-table-th" scope="col">Reading</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((t) => html`
+            <tr class=${'job-table-row' + (t.overall ? ' accuracy-compare__overall' : '')} key=${t.task} data-testid="accuracy-compare-row">
+              <td class="job-table-td">${t.task}</td>
+              <td class="job-table-td">${t.metric ?? '—'}${t.direction ? html` <span aria-hidden="true">${DIRECTION_GLYPH[t.direction] ?? ''}</span>` : ''}</td>
+              <td class="job-table-td">${fmtRate(t.baseline_metric_rate)}</td>
+              <td class="job-table-td">${fmtRate(t.candidate_metric_rate)}</td>
+              <td class="job-table-td">${fmtDelta(t.metric_delta_pp)}</td>
+              <td class="job-table-td">${t.b ?? '—'} / ${t.c ?? '—'} <span class="text-dim">(n=${t.paired ?? '—'})</span></td>
+              <td class="job-table-td">${fmtP(t.p_value)}</td>
+              <td class=${'job-table-td accuracy-reading accuracy-reading--' + (t.better ?? 'none')}>${readingText(t)}</td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+export function ComparePanel({ rows, candidate, baseline, onChange }) {
+  const [state, setState] = useState({ loading: false, error: null, payload: null });
+  const ready = Boolean(candidate && baseline);
+
+  useEffect(() => {
+    if (!ready) {
+      setState({ loading: false, error: null, payload: null });
+      return undefined;
+    }
+    const ac = new AbortController();
+    setState({ loading: true, error: null, payload: null });
+    fetchCompare(candidate, baseline, ac.signal)
+      .then((payload) => setState({ loading: false, error: null, payload }))
+      .catch((err) => {
+        if (err?.name === 'AbortError') return;
+        setState({ loading: false, error: describeLoadError(err?.message ?? err), payload: null });
+      });
+    return () => ac.abort();
+  }, [candidate, baseline, ready]);
+
+  const options = (current, other) => rows.map((r) => html`
+    <option key=${r.point_id} value=${r.point_id} selected=${r.point_id === current} disabled=${r.point_id === other}>${runLabel(r)}</option>
+  `);
+  const { loading, error, payload } = state;
+  const data = payload?.data;
+  return html`
+    <section class="card accuracy-compare" data-testid="accuracy-compare">
+      <h2 class="accuracy-group__title">Compare two runs</h2>
+      <div class="text-dim accuracy-meta">
+        Paired by problem (McNemar exact test). Descriptive only: this is not the gate verdict. Δ is candidate − baseline in the task's own metric.
+      </div>
+      <div class="accuracy-compare__pickers">
+        <label class="metric-selector-label" for="accuracy-cand">Candidate</label>
+        <select id="accuracy-cand" class="metric-selector-select" onchange=${(e) => onChange({ cand: e.target.value || undefined })}>
+          <option value="">Select a run…</option>
+          ${options(candidate, baseline)}
+        </select>
+        <label class="metric-selector-label" for="accuracy-base">Baseline</label>
+        <select id="accuracy-base" class="metric-selector-select" onchange=${(e) => onChange({ base: e.target.value || undefined })}>
+          <option value="">Select a run…</option>
+          ${options(baseline, candidate)}
+        </select>
+        ${ready && html`<button type="button" class="filter-tab" onclick=${() => onChange({ cand: undefined, base: undefined })}>Clear</button>`}
+      </div>
+      ${loading && html`<${LoadingPanel} label="Comparing…" testid="accuracy-compare-loading" />`}
+      ${error && html`<div class="error-banner" role="alert" data-testid="accuracy-compare-error">${error}</div>`}
+      ${data && !data.comparable && html`
+        <div class="accuracy-notes" data-testid="accuracy-compare-reason">${compareReasonText(data.reason)}</div>
+      `}
+      ${data?.comparable && html`<${CompareTable} data=${data} />`}
+      ${(payload?.warnings ?? []).length > 0 && html`
+        <ul class="accuracy-notes" data-testid="accuracy-compare-notes">
+          ${payload.warnings.map((w) => html`<li key=${w}>${w}</li>`)}
+        </ul>
+      `}
+    </section>
   `;
 }
 
@@ -110,6 +255,7 @@ export function RunCard({ row }) {
         <${ModelPill} model=${row.model ?? row.model_prefix ?? '—'} />
         <span class="meta-pill">${row.hw ?? '—'}${row.num_gpus ? ' ×' + row.num_gpus : ''}</span>
         <span class="meta-pill" title="Ledger status">${row.status ?? '—'}</span>
+        <${GradingPill} row=${row} />
         ${row.kind === 'behavior' && html`<span class="meta-pill" title="Gate mode">gate: ${row.gate?.mode ?? 'report'}</span>`}
         <span class="text-dim">${formatDate(row.recorded_at)} · sweep ${row.sweep_id ?? '—'}</span>
       </div>
@@ -139,6 +285,8 @@ export function Accuracy() {
   const benchmark = q.benchmark ?? '';
   const kind = q.kind ?? '';
   const urlModel = q.model ?? '';
+  const candidate = q.cand ?? '';
+  const baseline = q.base ?? '';
   const [model, setModel] = useState(urlModel);
   const [nonce, setNonce] = useState(0);
   const [state, setState] = useState({ loading: true, error: null, payload: null });
@@ -232,6 +380,10 @@ export function Accuracy() {
         </ul>
       `}
       ${loading && html`<div class="card"><${LoadingPanel} label="Loading accuracy results…" testid="accuracy-loading" /></div>`}
+
+      ${(rows.length >= 2 || candidate || baseline) && html`
+        <${ComparePanel} rows=${rows} candidate=${candidate} baseline=${baseline} onChange=${setQuery} />
+      `}
 
       ${!loading && !error && groups.length === 0 && html`
         <div class="card empty-state" data-testid="accuracy-empty">

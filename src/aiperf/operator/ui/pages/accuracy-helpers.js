@@ -114,10 +114,87 @@ export function rowNotes(row) {
   if ((row.grader_error_rate ?? 0) > 0) {
     notes.push(`${fmtRate(row.grader_error_rate)} of problems hit a grader error and are excluded from the totals.`);
   }
-  if (row.overall == null && (row.tasks?.length ?? 0) > 1) {
+  if (isUngraded(row)) {
+    notes.push(
+      'Generation only (_grading: deferred): not graded yet, so there are no scores. They appear once the sandbox grading is ingested as the next attempt.',
+    );
+  } else if (row.grading?.mode === 'sandbox') {
+    const from = row.grading.graded_from ? ` from generation ${row.grading.graded_from}` : '';
+    notes.push(`Graded in a no-network sandbox${row.grading.grader ? ` (${row.grading.grader})` : ''}${from}.`);
+  }
+  if (!isUngraded(row) && row.overall == null && (row.tasks?.length ?? 0) > 1) {
     notes.push('Tasks measure different metrics, so there is no combined figure.');
   }
   return notes;
+}
+
+/** True for a generation-only run (``_grading: deferred``): it carries counts, never scores. */
+export function isUngraded(row) {
+  return row?.grading?.state === 'ungraded';
+}
+
+/** Direction → "higher is better"; a missing direction (ungraded run) → "—", never "undefined". */
+export function directionText(direction) {
+  return DIRECTION_LABEL[direction] ?? (direction ? String(direction) : '—');
+}
+
+export const TASK_ROWS_COLLAPSED = 12;
+
+/** Benchmarks such as MMLU-Pro have dozens of tasks: show the first ``limit`` unless expanded. */
+export function visibleTasks(tasks, expanded, limit = TASK_ROWS_COLLAPSED) {
+  const all = tasks ?? [];
+  return expanded || all.length <= limit ? all : all.slice(0, limit);
+}
+
+/** Percentage-point delta with an explicit sign: 83.33 → "+83.3 pp", -16.67 → "−16.7 pp", 0 → "0.0 pp"; null → "—". */
+export function fmtDelta(pp, digits = 1) {
+  if (!finite(pp)) return '—';
+  const v = Number(pp.toFixed(digits));
+  if (v === 0) return `${(0).toFixed(digits)} pp`;
+  return `${v > 0 ? '+' : '−'}${Math.abs(v).toFixed(digits)} pp`;
+}
+
+/** McNemar p-value: 0.00195 → "p = 0.002", 0.0000004 → "p < 0.001", 1 → "p = 1.000"; null → "—". */
+export function fmtP(p) {
+  if (!finite(p)) return '—';
+  return p < 0.001 ? 'p < 0.001' : `p = ${p.toFixed(3)}`;
+}
+
+/** One paired-comparison row → plain wording. ``better`` is only set by the server when the difference is statistically significant. */
+export function readingText(stat) {
+  if (stat?.better === 'candidate') return 'Candidate better';
+  if (stat?.better === 'baseline') return 'Baseline better';
+  return 'No clear difference';
+}
+
+const COMPARE_REASONS = {
+  grading_deferred: 'One of the two runs is generation only and not graded yet, so there is nothing to compare.',
+  benchmark_mismatch: 'The two runs use a different benchmark, n-shots, grader or behavior rules, so they cannot be compared.',
+  problem_set_mismatch: 'The two runs do not cover the same problems (less than 95% in common), so they cannot be compared.',
+};
+
+/** Reason code from the compare route → sentence for the reader; unknown codes pass through. */
+export function compareReasonText(reason) {
+  return COMPARE_REASONS[reason] ?? (reason ? String(reason) : '');
+}
+
+/** Candidate/baseline point ids → "?candidate=…&baseline=…"; missing either → "" (no request). */
+export function buildCompareQuery(candidate, baseline) {
+  if (!candidate || !baseline) return '';
+  const p = new URLSearchParams();
+  p.set('candidate', candidate);
+  p.set('baseline', baseline);
+  return `?${p.toString()}`;
+}
+
+/** Short label for a run in a picker: "Qwen3.8-27B · sweep 3fa2 · attempt 2 · candidate". */
+export function runLabel(row) {
+  const attempt = String(row?.point_id ?? '').split('/')[1];
+  const parts = [row?.model ?? row?.model_prefix ?? '—', `sweep ${row?.sweep_id ?? '—'}`];
+  if (attempt) parts.push(`attempt ${attempt}`);
+  if (row?.status) parts.push(row.status);
+  if (isUngraded(row)) parts.push('not graded');
+  return parts.join(' · ');
 }
 
 /** Judge object → "model=judge-a, prompt_sha256=ab12"; none → null. */

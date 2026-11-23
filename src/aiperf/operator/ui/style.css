@@ -5597,3 +5597,10 @@ button[type="submit"]:hover {
 .accuracy-bar__fill--neutral { background: var(--overlay0); }
 .accuracy-notes { margin: var(--space-3) 0 0; padding-left: var(--space-5); color: var(--dim); font-size: var(--font-size-sm); }
 .accuracy-meta { margin-top: var(--space-2); font-size: var(--font-size-xs); word-break: break-all; }
+.accuracy-toggle { margin-top: var(--space-3); }
+.accuracy-pill--warn { color: var(--yellow); border-color: var(--yellow); }
+.accuracy-compare { margin-bottom: var(--space-6); }
+.accuracy-compare__pickers { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; margin: var(--space-3) 0; }
+.accuracy-compare__overall { font-weight: 600; }
+.accuracy-reading--candidate, .accuracy-reading--baseline { font-weight: 600; }
+.accuracy-reading--none { color: var(--dim); }

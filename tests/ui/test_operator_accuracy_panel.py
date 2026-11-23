@@ -120,6 +120,86 @@ def test_judge_text() -> None:
     assert out == ["model=judge-a, prompt_sha256=ab12", None, None]
 
 
+def test_generation_only_and_sandbox_graded_runs_say_so() -> None:
+    out = _node(
+        """
+        const ungraded = {kind: 'behavior', status: 'candidate', gate: {mode: 'report'}, audit_flags: ['accuracy_ungraded'],
+                          grading: {mode: 'deferred', state: 'ungraded'}, overall: null, tasks: [{}, {}]};
+        const sandbox = {kind: 'behavior', status: 'candidate', gate: {mode: 'report'}, audit_flags: [], overall: null,
+                         grading: {mode: 'sandbox', state: 'graded', grader: 'perfledger-sandbox', graded_from: 'sw/1/pk'}, tasks: [{}, {}]};
+        const inline = {kind: 'accuracy', status: 'official', gate: {mode: 'block'}, audit_flags: [],
+                        grading: {mode: 'inline', state: 'graded'}, overall: {}, tasks: [{}]};
+        return {
+          flags: [h.isUngraded(ungraded), h.isUngraded(sandbox), h.isUngraded(inline), h.isUngraded({}), h.isUngraded(null)],
+          ungraded: h.rowNotes(ungraded), sandbox: h.rowNotes(sandbox), inline: h.rowNotes(inline),
+        };
+        """
+    )
+    assert out["flags"] == [True, False, False, False, False]
+    joined = " | ".join(out["ungraded"])
+    assert "not graded yet" in joined and "no scores" in joined
+    assert "different metrics" not in joined  # an ungraded run has no metrics to disagree about
+    sandbox = " | ".join(out["sandbox"])
+    assert "no-network sandbox (perfledger-sandbox) from generation sw/1/pk" in sandbox
+    assert "different metrics" in sandbox  # graded, several tasks, no combined figure
+    assert out["inline"] == []
+
+
+def test_ungraded_task_rows_never_print_undefined() -> None:
+    out = _node("return [h.directionText(undefined), h.directionText(null), h.directionText('lower_is_better'), h.directionText('x')];")
+    assert out == ["—", "—", "lower is better", "x"]
+
+
+def test_many_task_benchmarks_collapse_after_a_dozen_rows() -> None:
+    out = _node(
+        """
+        const tasks = Array.from({length: 57}, (_, i) => ({task: 't' + i}));
+        return [h.visibleTasks(tasks, false).length, h.visibleTasks(tasks, true).length, h.visibleTasks(tasks.slice(0, 12), false).length,
+                h.visibleTasks(null, false), h.TASK_ROWS_COLLAPSED];
+        """
+    )
+    assert out == [12, 57, 12, [], 12]
+
+
+def test_paired_formatters_and_reading() -> None:
+    out = _node(
+        """
+        return {
+          delta: [h.fmtDelta(83.33), h.fmtDelta(-16.67), h.fmtDelta(0), h.fmtDelta(-0.04), h.fmtDelta(null), h.fmtDelta(NaN)],
+          p: [h.fmtP(0.00195), h.fmtP(0.0000004), h.fmtP(1), h.fmtP(0.5), h.fmtP(null)],
+          reading: [h.readingText({better: 'candidate'}), h.readingText({better: 'baseline'}), h.readingText({better: null}), h.readingText(null)],
+        };
+        """
+    )
+    assert out == {
+        "delta": ["+83.3 pp", "−16.7 pp", "0.0 pp", "0.0 pp", "—", "—"],
+        "p": ["p = 0.002", "p < 0.001", "p = 1.000", "p = 0.500", "—"],
+        "reading": ["Candidate better", "Baseline better", "No clear difference", "No clear difference"],
+    }
+
+
+def test_compare_query_reasons_and_run_labels() -> None:
+    out = _node(
+        """
+        return {
+          query: [h.buildCompareQuery('sw/2/pk', 'sw/1/pk'), h.buildCompareQuery('', 'b'), h.buildCompareQuery('a', null)],
+          reasons: ['grading_deferred', 'benchmark_mismatch', 'problem_set_mismatch', 'weird', null].map(h.compareReasonText),
+          labels: [h.runLabel({model: 'Qwen3.8-27B', sweep_id: '3fa2', point_id: '3fa2/2/pk', status: 'candidate'}),
+                   h.runLabel({model_prefix: 'q', point_id: 'x', grading: {state: 'ungraded'}}), h.runLabel(null)],
+        };
+        """
+    )
+    assert out["query"] == ["?candidate=sw%2F2%2Fpk&baseline=sw%2F1%2Fpk", "", ""]
+    r = out["reasons"]
+    assert "generation only" in r[0] and "different benchmark" in r[1] and "same problems" in r[2]
+    assert r[3] == "weird" and r[4] == ""
+    assert out["labels"] == [
+        "Qwen3.8-27B · sweep 3fa2 · attempt 2 · candidate",
+        "q · sweep — · not graded",
+        "— · sweep —",
+    ]
+
+
 # --------------------------------------------------------------------- static wiring
 def _read(rel: str) -> str:
     return (_UI_ROOT / rel).read_text(encoding="utf-8")
@@ -147,3 +227,7 @@ def test_accuracy_page_resolves_its_data_route_under_the_serving_prefix_and_neve
     assert "const ac = new AbortController();" in src and "ac.abort()" in src  # fetch is cancelled on unmount
     assert "safeHttpUrl(row.dashboard_url)" in src and 'rel="noopener noreferrer"' in src
     assert "FALLBACK_LABEL" in src  # the "not an official InferenceX result" label is always on screen
+    # The paired-comparison route lives under the same serving prefix; the page is its only caller and sends ids URL-encoded.
+    assert "new URL('perfledger-api/accuracy/compare', document.baseURI).pathname" in src
+    assert "buildCompareQuery(candidate, baseline)" in src and "export function ComparePanel" in src
+    assert src.count("new AbortController()") == 2 and src.count("ac.abort()") == 2  # list and compare are both cancelled
