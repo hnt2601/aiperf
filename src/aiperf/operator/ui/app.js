@@ -19,6 +19,7 @@ import { Leaderboard } from './pages/leaderboard.js';
 import { Compare } from './pages/compare.js';
 import { CompareEpochs } from './pages/compare-epochs.js';
 import { History } from './pages/history.js';
+import { Accuracy } from './pages/accuracy.js';
 import { Sweeps } from './pages/sweeps.js';
 import { SweepDetail } from './pages/sweep-detail.js';
 
@@ -79,6 +80,8 @@ function App() {
     page = html`<${Compare} />`;
   } else if (currentRoute === '/history') {
     page = html`<${History} />`;
+  } else if (currentRoute === '/accuracy') {
+    page = html`<${Accuracy} />`;
   } else {
     page = html`<div class="page-stub"><h2>Not Found</h2><p class="text-dim">${currentRoute}</p></div>`;
   }

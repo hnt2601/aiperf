@@ -96,6 +96,7 @@ function buildSegments(currentRoute) {
     '/leaderboard': 'Leaderboard',
     '/compare': 'Compare',
     '/history': 'History',
+    '/accuracy': 'Accuracy',
   };
 
   const label = PAGE_LABELS[currentRoute];

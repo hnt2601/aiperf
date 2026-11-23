@@ -13,6 +13,7 @@ const PAGES = [
   { label: 'Leaderboard', path: '/leaderboard' },
   { label: 'Compare', path: '/compare' },
   { label: 'History', path: '/history' },
+  { label: 'Accuracy', path: '/accuracy' },
 ];
 
 /**

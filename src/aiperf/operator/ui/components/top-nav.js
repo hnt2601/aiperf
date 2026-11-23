@@ -20,6 +20,7 @@ const ANALYTICS_GROUP = {
     { path: '/leaderboard', label: 'Leaderboard' },
     { path: '/compare', label: 'Compare' },
     { path: '/history', label: 'History' },
+    { path: '/accuracy', label: 'Accuracy' },
   ],
 };
 
